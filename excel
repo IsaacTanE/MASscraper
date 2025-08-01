@@ -15,3 +15,24 @@
 
   XLOOKUP("O/N", tenorsBlock, ratesBlock)
 )
+
+
+
+=LET(
+  searchDate, AD3,
+  allDates, A:A,
+  allTenors, C:C,
+  allRates, I:I,
+
+  startRow, XMATCH(searchDate, allDates, 0),
+  nextDateRow, IFERROR(
+    XMATCH(TRUE, ISNUMBER(INDEX(allDates, startRow+1):INDEX(allDates, 1048576))),
+    ROWS(allDates)
+  ) + startRow,
+
+  tenorsBlock, INDEX(allTenors, startRow+1):INDEX(allTenors, nextDateRow-1),
+  ratesBlock, INDEX(allRates, startRow+1):INDEX(allRates, nextDateRow-1),
+
+  matchRow, XMATCH(1, tenorsBlock, 0),
+  IF(ISNUMBER(matchRow), INDEX(ratesBlock, matchRow), NA())
+)
