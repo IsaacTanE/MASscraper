@@ -38,38 +38,109 @@ def last_business_day(ref=None):
 
 # === ORIGINAL (working) screenshot approach, with a private Excel instance ===
 def export_range_png_one(excel_path, sheet_name, range_addr, out_name="excel_range.png"):
-    """Copy range -> paste into temp chart -> export PNG. Closes only what it opened."""
+    """
+    Robust export:
+      1) Open source wb, bring range on screen (visible/normal window, goto, zoom).
+      2) Copy as picture (try metafile then bitmap).
+      3) Open a NEW temporary workbook and paste there.
+      4) Paste into a temp chart in the temp wb and export PNG.
+      5) Close only what we opened; quit only our private Excel instance.
+    """
     import time
     with com_apartment():
-        excel = win32.DispatchEx("Excel.Application")   # private instance
-        excel.Visible = False
+        xl = win32.DispatchEx("Excel.Application")   # private instance
+        # Make visible so Windows actually paints the range
+        xl.Visible = True
+        xl.ScreenUpdating = True
+        xl.DisplayAlerts = False
         try:
-            wb = excel.Workbooks.Open(excel_path)
-            ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
+            src_wb = xl.Workbooks.Open(excel_path)
+            ws = src_wb.Worksheets(sheet_name) if sheet_name else src_wb.ActiveSheet
+            ws.Activate()
+
+            # Make sure the window is normal & the range is actually on-screen
+            try:
+                xl.ActiveWindow.WindowState = -4143  # xlNormal
+                xl.ActiveWindow.Zoom = 100
+            except Exception:
+                pass
+
             rng = ws.Range(range_addr)
+            ws.Application.Goto(rng, Scroll=True)
+            time.sleep(0.3)
 
-            # Copy as picture (screen, bitmap)
-            rng.CopyPicture(Appearance=1, Format=2)  # 1=xlScreen, 2=xlBitmap
+            # Try copy as METAFILE first, then BITMAP as fallback
+            copied = False
+            for fmt in (-4147, 2):  # xlPicture, xlBitmap
+                for _ in range(4):
+                    try:
+                        rng.CopyPicture(Appearance=1, Format=fmt)
+                        pythoncom.PumpWaitingMessages()
+                        time.sleep(0.3)
+                        copied = True
+                        break
+                    except Exception:
+                        time.sleep(0.25)
+                if copied:
+                    break
+            if not copied:
+                raise RuntimeError(f"Could not CopyPicture for {range_addr}")
 
-            # Temp chart sized to the range, then paste and export
-            left, top, width, height = 0, 0, rng.Width, rng.Height
-            chart_obj = ws.ChartObjects().Add(left, top, width, height)
-            chart = chart_obj.Chart
+            # Create a brand-new empty workbook to paste/export cleanly
+            tmp_wb = xl.Workbooks.Add()
+            tmp_ws = tmp_wb.Worksheets(1)
+            tmp_ws.Activate()
 
-            # Small pause so clipboard is ready
+            # Paste the picture into the temp sheet
+            pic_shape = None
+            for _ in range(6):
+                try:
+                    # In newer Excel, Paste returns a Shape; else we fetch the last shape
+                    pasted = tmp_ws.Paste()
+                    pic_shape = pasted if hasattr(pasted, "Name") else tmp_ws.Shapes(tmp_ws.Shapes.Count)
+                    break
+                except Exception:
+                    time.sleep(0.25)
+            if not pic_shape:
+                # Fallback: try Pictures().Paste then fetch last shape
+                try:
+                    tmp_ws.Pictures().Paste()
+                    pic_shape = tmp_ws.Shapes(tmp_ws.Shapes.Count)
+                except Exception:
+                    raise RuntimeError("Paste into temp workbook failed")
+
+            # Create a temp chart in the temp workbook and export
+            width = max(2, int(pic_shape.Width))
+            height = max(2, int(pic_shape.Height))
+            chobj = tmp_ws.ChartObjects().Add(0, 0, width, height)
+            chart = chobj.Chart
+            # Select the pasted picture and copy it, then paste onto the chart
+            pic_shape.Copy()
             pythoncom.PumpWaitingMessages()
-            time.sleep(0.15)
+            time.sleep(0.2)
             chart.Paste()
 
             out_path = Path(tempfile.gettempdir()) / out_name
             chart.Export(str(out_path), "PNG")
 
-            # Clean up
-            chart_obj.Delete()
-            wb.Close(SaveChanges=False)
+            # Clean up temp objects
+            try: chobj.Delete()
+            except Exception: pass
+            try: pic_shape.Delete()
+            except Exception: pass
+
+            # Close workbooks without saving
+            tmp_wb.Close(SaveChanges=False)
+            src_wb.Close(SaveChanges=False)
+
+            # Sanity check file size
+            if not out_path.exists() or out_path.stat().st_size < 1024:
+                raise RuntimeError("Export produced a tiny/blank PNG; rendering likely failed.")
+
             return str(out_path)
         finally:
-            excel.Quit()
+            # If you prefer to keep Excel hidden afterward, toggle Visible=False here before Quit()
+            xl.Quit()
 
 def read_cell(excel_path, sheet_name, cell_addr):
     """Read a single cell value from a fresh, private Excel instance."""
