@@ -34,43 +34,68 @@ def last_business_day(ref=None):
     return d
 
 def export_range_png_one(excel_path, sheet_name, range_addr, out_name="excel_range.png"):
-    """Robust: paste range bitmap into a temp Chart and export as PNG."""
+    """
+    Robust export that avoids blank images:
+      - make Excel visible and foreground (just during capture)
+      - copy as metafile (xlPicture) instead of bitmap
+      - paste into a temp chart and export
+    """
     import time
     with com_apartment():
         xl = win32.DispatchEx("Excel.Application")
-        xl.Visible = False
-        xl.ScreenUpdating = False
+        # MAKE IT VISIBLE so Windows actually renders the range
+        xl.Visible = True
+        xl.ScreenUpdating = True
         xl.DisplayAlerts = False
         try:
             wb = xl.Workbooks.Open(excel_path)
             ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
             ws.Activate()
-            rng = ws.Range(range_addr)
 
-            chobj = ws.ChartObjects().Add(0, 0, max(2, int(rng.Width)), max(2, int(rng.Height)))
+            # Make sure the window can render (not minimized/offscreen)
+            try:
+                xl.ActiveWindow.WindowState = -4143  # xlNormal
+            except Exception:
+                pass
+            try:
+                xl.ActiveWindow.Zoom = 100
+            except Exception:
+                pass
+
+            rng = ws.Range(range_addr)
+            # Scroll the range into view so CopyPicture has real pixels to grab
+            ws.Application.Goto(rng, Scroll=True)
+            time.sleep(0.3)
+
+            # Create a temp chart sized to the range
+            width, height = max(2, int(rng.Width)), max(2, int(rng.Height))
+            chobj = ws.ChartObjects().Add(0, 0, width, height)
             chart = chobj.Chart
 
             out_path = Path(tempfile.gettempdir()) / out_name
             ok = False
+            # Use xlPicture (-4147) metafile; more reliable than xlBitmap(2)
             for _ in range(6):
-                rng.CopyPicture(Appearance=1, Format=2)  # xlScreen=1, xlBitmap=2
+                rng.CopyPicture(Appearance=1, Format=-4147)  # xlScreen=1, xlPicture=-4147
                 pythoncom.PumpWaitingMessages()
-                time.sleep(0.25)
+                time.sleep(0.35)  # give clipboard time
                 chart.Paste()
                 chart.Export(str(out_path), "PNG")
                 if out_path.exists() and out_path.stat().st_size > 1024:
                     ok = True
                     break
-                time.sleep(0.25)
+                time.sleep(0.35)
+
             chobj.Delete()
             if not ok:
-                raise RuntimeError(f"Failed to export {range_addr}")
+                raise RuntimeError(f"Failed to export visible image for {range_addr}")
             return str(out_path)
         finally:
-            try: xl.ScreenUpdating = True
-            except Exception: pass
-            try: wb.Close(SaveChanges=False)
-            except Exception: pass
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+            # you can set xl.Visible=False here if you don't want to see Excel linger
             xl.Quit()
 
 def read_cell(excel_path, sheet_name, cell_addr):
