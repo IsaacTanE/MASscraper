@@ -1,0 +1,75 @@
+# -*- coding: utf-8 -*-
+# Requirements: pip install pywin32
+# Works on Windows with desktop Excel + Outlook installed and signed in.
+
+import tempfile
+from pathlib import Path
+import win32com.client as win32
+
+EXCEL_PATH = r"C:\path\to\your\workbook.xlsx"   # <- change me
+SHEET_NAME = None                                # e.g. "Sheet1" or None for ActiveSheet
+RANGE_ADDR = "A1:E40"                            # the range to screenshot
+
+def export_range_as_png(excel_path, range_addr="A1:E40", sheet_name=None, out_path=None):
+    """Exports an Excel range as a PNG by copying it into a temporary chart and exporting."""
+    excel = win32.gencache.EnsureDispatch("Excel.Application")
+    excel.Visible = False
+    try:
+        wb = excel.Workbooks.Open(excel_path)
+        ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
+
+        rng = ws.Range(range_addr)
+        # Copy the range as a picture (screen appearance, bitmap format)
+        rng.CopyPicture(Appearance=1, Format=2)  # 1=xlScreen, 2=xlBitmap
+
+        # Drop a temporary chart exactly sized to the range, paste, then export
+        # Left, Top in points from sheet's top-left. Width/Height also in points.
+        left, top, width, height = 0, 0, rng.Width, rng.Height
+        chart_obj = ws.ChartObjects().Add(left, top, width, height)
+        chart = chart_obj.Chart
+        chart.Paste()
+        out_path = Path(out_path) if out_path else Path(tempfile.gettempdir()) / "excel_range.png"
+        chart.Export(str(out_path), "PNG")
+
+        # Clean up the temporary chart
+        chart_obj.Delete()
+        wb.Close(SaveChanges=False)
+        return str(out_path)
+    finally:
+        excel.Quit()
+
+def reply_with_inline_image(image_path):
+    """Replies to the currently selected email in Outlook and inserts the image at the top."""
+    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+    explorer = outlook.ActiveExplorer()
+    if explorer is None or explorer.Selection.Count == 0:
+        raise RuntimeError("Open Outlook and select the email thread first, then run this script.")
+
+    original = explorer.Selection.Item(1)  # first selected item
+    reply = original.Reply()
+    reply.Display()  # show the draft so you can review/send
+
+    # Use WordEditor to insert the image inline at the very top of the reply body
+    inspector = reply.GetInspector
+    doc = inspector.WordEditor  # Word Document
+    top_range = doc.Range(0, 0)
+    top_range.InsertAfter("See screenshot below:\r\n")
+    # Insert image right after the inserted line
+    insert_at = doc.Range(0, len("See screenshot below:\r\n"))
+    doc.InlineShapes.AddPicture(FileName=image_path, LinkToFile=False, SaveWithDocument=True, Range=insert_at)
+
+    # Optionally add an extra newline after the image for spacing
+    after_img = doc.Range(insert_at.End, insert_at.End)
+    after_img.InsertAfter("\r\n")
+
+    # Leave the window open for you to press Send manually
+    return reply
+
+def main():
+    png_path = export_range_as_png(EXCEL_PATH, RANGE_ADDR, SHEET_NAME)
+    print(f"Saved image to: {png_path}")
+    reply_with_inline_image(png_path)
+    print("Reply draft opened in Outlook with the image inserted. Review and press Send manually.")
+
+if __name__ == "__main__":
+    main()
