@@ -1,28 +1,23 @@
 # -*- coding: utf-8 -*-
-# Windows + Office desktop. Install: pip install pywin32
-
 import tempfile
 from pathlib import Path
 from contextlib import contextmanager
-import pythoncom
-import win32com.client as win32
 from datetime import datetime, timedelta
 
-# ====== CONFIGURE THESE ======
+import pythoncom
+import win32com.client as win32
+
+# ====== CONFIGURE ======
 EXCEL_PATH = r"C:\path\to\your\workbook.xlsx"   # <- change me
-SHEET1_NAME = None                               # e.g. "Sheet1"; or None = ActiveSheet
-RANGE1_ADDR = "A1:E40"
+SHEET_NAME = None                                # None = ActiveSheet
+RANGE_ADDR = "A1:E40"
 
-SHEET2_NAME = "Yield"
-RANGE2_ADDR = "L1:Q27"
+YIELD_SHEET = "Yield"
+YIELD_CELL = "L3"
 
-TARGET_SENDER_SMTP = "isaactane@dbs.com"         # since it's in Sent Items
-
-# Optional: add company/SG holidays in 'YYYY-MM-DD' format
-HOLIDAYS = {
-    # "2025-08-09",  # example
-}
-# =============================
+TARGET_SENDER_SMTP = "isaactane@dbs.com"         # it's in Sent Items
+HOLIDAYS = set()                                 # optional: {"2025-01-01", ...}
+# =======================
 
 @contextmanager
 def com_apartment():
@@ -32,87 +27,67 @@ def com_apartment():
     finally:
         pythoncom.CoUninitialize()
 
-def last_business_day(ref_dt=None, holidays=None):
-    """Return the last business day (Mon-Fri and not in holidays)."""
-    if ref_dt is None:
-        ref_dt = datetime.now()
-    d = ref_dt - timedelta(days=1)
-    holidays = holidays or set()
-    while d.weekday() >= 5 or d.strftime("%Y-%m-%d") in holidays:  # 5=Sat,6=Sun
+def last_business_day(ref=None):
+    d = (ref or datetime.now()) - timedelta(days=1)
+    while d.weekday() >= 5 or d.strftime("%Y-%m-%d") in HOLIDAYS:  # 5=Sat,6=Sun
         d -= timedelta(days=1)
     return d
 
-def export_range_as_pngs(excel_path, shots):
-    """
-    Export multiple ranges to PNGs using a dedicated Excel instance; closes only what we opened.
-    One range at a time to avoid clipboard overwriting.
-    """
+def export_range_png_one(excel_path, sheet_name, range_addr, out_name="excel_range.png"):
+    """Robust: paste range bitmap into a temp Chart and export as PNG."""
     import time
-    from pythoncom import com_error
-
     with com_apartment():
-        excel = win32.DispatchEx("Excel.Application")
-        excel.Visible = False
-        excel.ScreenUpdating = False
-        excel.DisplayAlerts = False
-        paths = []
+        xl = win32.DispatchEx("Excel.Application")
+        xl.Visible = False
+        xl.ScreenUpdating = False
+        xl.DisplayAlerts = False
         try:
-            wb = excel.Workbooks.Open(excel_path)
-            for sheet_name, range_addr, out_name in shots:
-                ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
-                ws.Activate()
-                rng = ws.Range(range_addr)
+            wb = xl.Workbooks.Open(excel_path)
+            ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
+            ws.Activate()
+            rng = ws.Range(range_addr)
 
-                # Create chart sized to range
-                width, height = max(2, int(rng.Width)), max(2, int(rng.Height))
-                chobj = ws.ChartObjects().Add(0, 0, width, height)
-                chart = chobj.Chart
+            chobj = ws.ChartObjects().Add(0, 0, max(2, int(rng.Width)), max(2, int(rng.Height)))
+            chart = chobj.Chart
 
-                # Retry loop for reliability
-                exported = False
-                for attempt in range(6):
-                    try:
-                        rng.CopyPicture(Appearance=1, Format=2)  # xlScreen=1, xlBitmap=2
-                        pythoncom.PumpWaitingMessages()
-                        time.sleep(0.3)  # give clipboard time to settle
-                        chart.Paste()
-                        out_path = Path(tempfile.gettempdir()) / out_name
-                        chart.Export(str(out_path), "PNG")
-                        if out_path.exists() and out_path.stat().st_size > 1024:
-                            exported = True
-                            paths.append(str(out_path))
-                            break
-                        time.sleep(0.3)
-                    except com_error:
-                        time.sleep(0.3)
-
-                # Clean up this chart before the next loop
-                try:
-                    chobj.Delete()
-                except Exception:
-                    pass
-
-                if not exported:
-                    raise RuntimeError(f"Failed to export {sheet_name or '(ActiveSheet)'}!{range_addr}")
-
-                # Give Excel a short rest before starting next screenshot
-                time.sleep(0.5)
-
-            wb.Close(SaveChanges=False)
+            out_path = Path(tempfile.gettempdir()) / out_name
+            ok = False
+            for _ in range(6):
+                rng.CopyPicture(Appearance=1, Format=2)  # xlScreen=1, xlBitmap=2
+                pythoncom.PumpWaitingMessages()
+                time.sleep(0.25)
+                chart.Paste()
+                chart.Export(str(out_path), "PNG")
+                if out_path.exists() and out_path.stat().st_size > 1024:
+                    ok = True
+                    break
+                time.sleep(0.25)
+            chobj.Delete()
+            if not ok:
+                raise RuntimeError(f"Failed to export {range_addr}")
+            return str(out_path)
         finally:
-            try:
-                excel.ScreenUpdating = True
-            except Exception:
-                pass
-            try:
-                excel.Quit()
-            except Exception:
-                pass
+            try: xl.ScreenUpdating = True
+            except Exception: pass
+            try: wb.Close(SaveChanges=False)
+            except Exception: pass
+            xl.Quit()
 
-        return paths
+def read_cell(excel_path, sheet_name, cell_addr):
+    """Read a single cell value (no side effects)."""
+    with com_apartment():
+        xl = win32.DispatchEx("Excel.Application")
+        xl.Visible = False
+        try:
+            wb = xl.Workbooks.Open(excel_path)
+            ws = wb.Worksheets(sheet_name)
+            val = ws.Range(cell_addr).Value
+            wb.Close(SaveChanges=False)
+            return val
+        finally:
+            xl.Quit()
 
 def _sender_smtp(mail):
-    """Best-effort to get SMTP of the sender (handles Exchange)."""
     try:
         if mail.SenderEmailType == "EX":
             exuser = mail.Sender.GetExchangeUser()
@@ -123,50 +98,27 @@ def _sender_smtp(mail):
         return None
 
 def _restrict_contains(items, contains_text):
-    """
-    Use DASL query for case-insensitive 'contains' on Subject.
-    """
-    # Escape embedded double-quotes for DASL
-    esc = contains_text.replace('"', '""')
-    dasl = f'@SQL="urn:schemas:httpmail:subject" LIKE \'%{esc}%\''
+    esc = contains_text.replace("'", "''")
+    dasl = f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{esc}%'"
     try:
         return items.Restrict(dasl)
     except Exception:
-        # Some profiles balk at @SQL—fallback to simple Items.Find/FindNext loop
+        # Fallback loop if DASL not allowed
         return [itm for itm in items if hasattr(itm, "Subject") and contains_text.lower() in (itm.Subject or "").lower()]
 
 def find_sent_item_contains(subject_contains, sender_smtp=None, fallback_contains=None):
-    """
-    Find newest item in Sent Items where Subject contains subject_contains (DASL LIKE).
-    If not found and fallback_contains provided, try the fallback.
-    """
     outlook = win32.gencache.EnsureDispatch("Outlook.Application")
     ns = outlook.GetNamespace("MAPI")
-    sent_folder = ns.GetDefaultFolder(5)  # olFolderSentMail
-
-    items = sent_folder.Items
+    sent = ns.GetDefaultFolder(5)  # olFolderSentMail
+    items = sent.Items
     items.Sort("[SentOn]", True)  # newest first
 
-    # Primary attempt with dated snippet
-    candidates = _restrict_contains(items, subject_contains)
-    for itm in candidates:
-        try:
-            if itm.Class != 43:  # olMail
-                continue
-            if sender_smtp:
-                smtp = _sender_smtp(itm)
-                if smtp and smtp.lower() != sender_smtp.lower():
-                    continue
-            return itm
-        except Exception:
+    for snippet in (subject_contains, fallback_contains):
+        if not snippet:
             continue
-
-    # Fallback attempt with base snippet (without date), if provided
-    if fallback_contains:
-        candidates = _restrict_contains(items, fallback_contains)
-        for itm in candidates:
+        for itm in _restrict_contains(items, snippet):
             try:
-                if itm.Class != 43:
+                if itm.Class != 43:  # olMail
                     continue
                 if sender_smtp:
                     smtp = _sender_smtp(itm)
@@ -175,67 +127,50 @@ def find_sent_item_contains(subject_contains, sender_smtp=None, fallback_contain
                 return itm
             except Exception:
                 continue
+    raise RuntimeError(f"No Sent Items message found containing: '{subject_contains}'")
 
-    raise RuntimeError(f"No matching message found in Sent Items for contains: '{subject_contains}'.")
-
-def reply_with_two_images(subject_contains, sender_smtp, img1_path, img2_path, fallback_contains=None):
-    """Open a Reply to the specific Sent Items message and paste img2 below img1."""
+def reply_with_image_and_text(img_path, text_below, subject_contains, sender_smtp, fallback_contains=None):
     with com_apartment():
         original = find_sent_item_contains(subject_contains, sender_smtp, fallback_contains)
         reply = original.Reply()
         reply.Display()
 
-        inspector = reply.GetInspector
-        doc = inspector.WordEditor
-
-        intro = "See screenshots below:\r\n"
+        doc = reply.GetInspector.WordEditor  # Word document
+        intro = "See screenshot and value below:\r\n"
         doc.Range(0, 0).InsertAfter(intro)
 
-        r1 = doc.Range(0, len(intro))
-        doc.InlineShapes.AddPicture(
-            FileName=img1_path, LinkToFile=False, SaveWithDocument=True, Range=r1
-        )
+        r_img = doc.Range(0, len(intro))
+        doc.InlineShapes.AddPicture(FileName=img_path, LinkToFile=False, SaveWithDocument=True, Range=r_img)
 
-        after_first = doc.Range(r1.End, r1.End)
-        after_first.InsertAfter("\r\n")
-
-        r2 = doc.Range(after_first.End, after_first.End)
-        doc.InlineShapes.AddPicture(
-            FileName=img2_path, LinkToFile=False, SaveWithDocument=True, Range=r2
-        )
-
-        doc.Range(r2.End, r2.End).InsertAfter("\r\n")
+        # newline + value below
+        after = doc.Range(r_img.End, r_img.End)
+        after.InsertAfter("\r\n")
+        doc.Range(after.End, after.End).InsertAfter(f"L3 (Yield): {text_below}\r\n")
         return reply
 
 def main():
-    # Date snippet based on last business day (accounts for weekends + your optional holiday set)
-    last_bd = last_business_day(datetime.now(), HOLIDAYS)
+    # Build subject snippet for last business day
+    last_bd = last_business_day()
     date_str = last_bd.strftime("%d/%m/%Y")
-
-    # Build the subject snippets
-    # Use the inner phrase so contains is robust (works whether it's "RE:", "FW:", etc.)
     base_phrase = "SGS Portfolios and B-S ("
     subject_contains = f"{base_phrase}{date_str})"
-    fallback_contains = base_phrase  # if date-specific search fails, match any with the base phrase
+    fallback_contains = base_phrase  # if date-specific fails
 
-    # Export both screenshots
-    img1_name = "excel_range_1.png"
-    img2_name = "excel_range_2.png"
-    paths = export_range_as_pngs(
-        EXCEL_PATH,
-        [
-            (SHEET1_NAME, RANGE1_ADDR, img1_name),         # A1:E40
-            (SHEET2_NAME, RANGE2_ADDR, img2_name),         # Yield!L1:Q27
-        ],
+    # 1) Screenshot A1:E40
+    png_path = export_range_png_one(EXCEL_PATH, SHEET_NAME, RANGE_ADDR, "excel_range_1.png")
+
+    # 2) Read Yield!L3
+    l3_val = read_cell(EXCEL_PATH, YIELD_SHEET, YIELD_CELL)
+
+    # 3) Reply and paste image + value
+    reply_with_image_and_text(
+        png_path,
+        l3_val,
+        subject_contains,
+        TARGET_SENDER_SMTP,
+        fallback_contains=fallback_contains
     )
-    img1_path, img2_path = paths
-
-    print(f"Saved image 1 to: {img1_path}")
-    print(f"Saved image 2 to: {img2_path}")
-    print(f"Searching Sent Items for subject contains: '{subject_contains}' (fallback: '{fallback_contains}')")
-
-    reply_with_two_images(subject_contains, TARGET_SENDER_SMTP, img1_path, img2_path, fallback_contains)
-    print("Reply draft opened with both images pasted. Review and press Send manually.")
+    print("Reply draft opened with screenshot and L3 value. Review and press Send manually.")
 
 if __name__ == "__main__":
     main()
