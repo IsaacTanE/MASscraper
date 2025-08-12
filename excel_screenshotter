@@ -6,6 +6,7 @@ from pathlib import Path
 from contextlib import contextmanager
 import pythoncom
 import win32com.client as win32
+from datetime import datetime, timedelta
 
 # ====== CONFIGURE THESE ======
 EXCEL_PATH = r"C:\path\to\your\workbook.xlsx"   # <- change me
@@ -15,8 +16,12 @@ RANGE1_ADDR = "A1:E40"
 SHEET2_NAME = "Yield"
 RANGE2_ADDR = "L1:Q27"
 
-TARGET_SUBJECT = "RE: SGS Portfolios and B-S (11/08/2025)"
 TARGET_SENDER_SMTP = "isaactane@dbs.com"         # since it's in Sent Items
+
+# Optional: add company/SG holidays in 'YYYY-MM-DD' format
+HOLIDAYS = {
+    # "2025-08-09",  # example
+}
 # =============================
 
 @contextmanager
@@ -27,15 +32,20 @@ def com_apartment():
     finally:
         pythoncom.CoUninitialize()
 
+def last_business_day(ref_dt=None, holidays=None):
+    """Return the last business day (Mon-Fri and not in holidays)."""
+    if ref_dt is None:
+        ref_dt = datetime.now()
+    d = ref_dt - timedelta(days=1)
+    holidays = holidays or set()
+    while d.weekday() >= 5 or d.strftime("%Y-%m-%d") in holidays:  # 5=Sat,6=Sun
+        d -= timedelta(days=1)
+    return d
+
 def export_range_as_pngs(excel_path, shots):
-    """
-    Export multiple ranges to PNGs using a dedicated Excel instance so we only close what we opened.
-    shots: list of tuples (sheet_name_or_None, range_addr, output_filename)
-    Returns: list of file paths
-    """
+    """Export multiple ranges to PNGs using a dedicated Excel instance so we only close what we opened."""
     with com_apartment():
-        # DispatchEx -> starts a NEW Excel instance (won’t interfere with an existing one)
-        excel = win32.DispatchEx("Excel.Application")
+        excel = win32.DispatchEx("Excel.Application")  # separate Excel instance
         excel.Visible = False
         paths = []
         try:
@@ -43,9 +53,8 @@ def export_range_as_pngs(excel_path, shots):
             for sheet_name, range_addr, out_name in shots:
                 ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
                 rng = ws.Range(range_addr)
-                rng.CopyPicture(Appearance=1, Format=2)  # 1=xlScreen, 2=xlBitmap
+                rng.CopyPicture(Appearance=1, Format=2)  # xlScreen=1, xlBitmap=2
 
-                # Paste into a temp chart sized to the range, then export as PNG
                 left, top, width, height = 0, 0, rng.Width, rng.Height
                 chart_obj = ws.ChartObjects().Add(left, top, width, height)
                 chart = chart_obj.Chart
@@ -56,11 +65,9 @@ def export_range_as_pngs(excel_path, shots):
                 chart_obj.Delete()
                 paths.append(str(out_path))
 
-            # Close ONLY the workbook we opened; do not save changes
-            wb.Close(SaveChanges=False)
+            wb.Close(SaveChanges=False)  # close only this workbook
         finally:
-            # Quit this private Excel instance (safe—does not close user’s other workbooks)
-            excel.Quit()
+            excel.Quit()  # close only this instance of Excel
         return paths
 
 def _sender_smtp(mail):
@@ -74,21 +81,36 @@ def _sender_smtp(mail):
     except Exception:
         return None
 
-def find_sent_item(subject_exact, sender_smtp=None):
-    """Find the most recent item in Sent Items matching the exact subject and (optionally) sender SMTP."""
+def _restrict_contains(items, contains_text):
+    """
+    Use DASL query for case-insensitive 'contains' on Subject.
+    """
+    # Escape embedded double-quotes for DASL
+    esc = contains_text.replace('"', '""')
+    dasl = f'@SQL="urn:schemas:httpmail:subject" LIKE \'%{esc}%\''
+    try:
+        return items.Restrict(dasl)
+    except Exception:
+        # Some profiles balk at @SQL—fallback to simple Items.Find/FindNext loop
+        return [itm for itm in items if hasattr(itm, "Subject") and contains_text.lower() in (itm.Subject or "").lower()]
+
+def find_sent_item_contains(subject_contains, sender_smtp=None, fallback_contains=None):
+    """
+    Find newest item in Sent Items where Subject contains subject_contains (DASL LIKE).
+    If not found and fallback_contains provided, try the fallback.
+    """
     outlook = win32.gencache.EnsureDispatch("Outlook.Application")
     ns = outlook.GetNamespace("MAPI")
     sent_folder = ns.GetDefaultFolder(5)  # olFolderSentMail
 
     items = sent_folder.Items
-    items.Sort("[SentOn]", True)
+    items.Sort("[SentOn]", True)  # newest first
 
-    safe_subject = subject_exact.replace('"', '""')
-    restricted = items.Restrict(f'[Subject] = "{safe_subject}"')
-
-    for itm in restricted:
+    # Primary attempt with dated snippet
+    candidates = _restrict_contains(items, subject_contains)
+    for itm in candidates:
         try:
-            if itm.Class != 43:  # 43 = olMail
+            if itm.Class != 43:  # olMail
                 continue
             if sender_smtp:
                 smtp = _sender_smtp(itm)
@@ -98,50 +120,70 @@ def find_sent_item(subject_exact, sender_smtp=None):
         except Exception:
             continue
 
-    raise RuntimeError("No matching message found in Sent Items. Check subject and sender.")
+    # Fallback attempt with base snippet (without date), if provided
+    if fallback_contains:
+        candidates = _restrict_contains(items, fallback_contains)
+        for itm in candidates:
+            try:
+                if itm.Class != 43:
+                    continue
+                if sender_smtp:
+                    smtp = _sender_smtp(itm)
+                    if smtp and smtp.lower() != sender_smtp.lower():
+                        continue
+                return itm
+            except Exception:
+                continue
 
-def reply_with_two_images(subject_exact, sender_smtp, img1_path, img2_path):
+    raise RuntimeError(f"No matching message found in Sent Items for contains: '{subject_contains}'.")
+
+def reply_with_two_images(subject_contains, sender_smtp, img1_path, img2_path, fallback_contains=None):
     """Open a Reply to the specific Sent Items message and paste img2 below img1."""
     with com_apartment():
-        original = find_sent_item(subject_exact, sender_smtp)
+        original = find_sent_item_contains(subject_contains, sender_smtp, fallback_contains)
         reply = original.Reply()
         reply.Display()
 
         inspector = reply.GetInspector
-        doc = inspector.WordEditor  # Word Document
+        doc = inspector.WordEditor
 
-        # Intro text
         intro = "See screenshots below:\r\n"
         doc.Range(0, 0).InsertAfter(intro)
 
-        # Insert first image right after intro
         r1 = doc.Range(0, len(intro))
         doc.InlineShapes.AddPicture(
             FileName=img1_path, LinkToFile=False, SaveWithDocument=True, Range=r1
         )
 
-        # New line after first image
         after_first = doc.Range(r1.End, r1.End)
         after_first.InsertAfter("\r\n")
 
-        # Insert second image BELOW the first (after the newline)
         r2 = doc.Range(after_first.End, after_first.End)
         doc.InlineShapes.AddPicture(
             FileName=img2_path, LinkToFile=False, SaveWithDocument=True, Range=r2
         )
 
-        # Optional extra spacing
         doc.Range(r2.End, r2.End).InsertAfter("\r\n")
         return reply
 
 def main():
+    # Date snippet based on last business day (accounts for weekends + your optional holiday set)
+    last_bd = last_business_day(datetime.now(), HOLIDAYS)
+    date_str = last_bd.strftime("%d/%m/%Y")
+
+    # Build the subject snippets
+    # Use the inner phrase so contains is robust (works whether it's "RE:", "FW:", etc.)
+    base_phrase = "SGS Portfolios and B-S ("
+    subject_contains = f"{base_phrase}{date_str})"
+    fallback_contains = base_phrase  # if date-specific search fails, match any with the base phrase
+
     # Export both screenshots
     img1_name = "excel_range_1.png"
     img2_name = "excel_range_2.png"
     paths = export_range_as_pngs(
         EXCEL_PATH,
         [
-            (SHEET1_NAME, RANGE1_ADDR, img1_name),         # e.g., ActiveSheet A1:E40
+            (SHEET1_NAME, RANGE1_ADDR, img1_name),         # A1:E40
             (SHEET2_NAME, RANGE2_ADDR, img2_name),         # Yield!L1:Q27
         ],
     )
@@ -149,9 +191,9 @@ def main():
 
     print(f"Saved image 1 to: {img1_path}")
     print(f"Saved image 2 to: {img2_path}")
+    print(f"Searching Sent Items for subject contains: '{subject_contains}' (fallback: '{fallback_contains}')")
 
-    # Reply to the exact message and embed images
-    reply_with_two_images(TARGET_SUBJECT, TARGET_SENDER_SMTP, img1_path, img2_path)
+    reply_with_two_images(subject_contains, TARGET_SENDER_SMTP, img1_path, img2_path, fallback_contains)
     print("Reply draft opened with both images pasted. Review and press Send manually.")
 
 if __name__ == "__main__":
