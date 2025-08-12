@@ -44,154 +44,60 @@ def last_business_day(ref_dt=None, holidays=None):
 
 def export_range_as_pngs(excel_path, shots):
     """
-    Export multiple ranges to PNGs using a dedicated Excel instance; closes only what we opened.
+    Robust export using a temporary ChartObject only (no Shape/Picture paste).
     shots: list of tuples (sheet_name_or_None, range_addr, output_filename)
     Returns: list[str] of file paths
     """
     import time
-    import traceback
     from pythoncom import com_error
 
-    def log_step(msg):
-        print(f"[excel-export] {msg}", flush=True)
-
     with com_apartment():
-        excel = win32.DispatchEx("Excel.Application")  # isolated instance
+        excel = win32.DispatchEx("Excel.Application")
         excel.Visible = False
         excel.ScreenUpdating = False
         excel.DisplayAlerts = False
         paths = []
         try:
-            try:
-                log_step(f"Opening workbook: {excel_path}")
-                wb = excel.Workbooks.Open(excel_path)
-            except com_error as e:
-                log_step(f"ERROR opening workbook: {e}")
-                raise
+            wb = excel.Workbooks.Open(excel_path)
+            for sheet_name, range_addr, out_name in shots:
+                ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
+                ws.Activate()
+                rng = ws.Range(range_addr)
 
-            for i, (sheet_name, range_addr, out_name) in enumerate(shots, 1):
-                log_step(f"[shot {i}] Preparing {sheet_name or '(ActiveSheet)'}!{range_addr}")
-                try:
-                    ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
-                except com_error as e:
-                    log_step(f"ERROR getting worksheet '{sheet_name}': {e}")
-                    raise
+                # Create a temp chart sized to the range
+                width, height = max(2, int(rng.Width)), max(2, int(rng.Height))
+                chobj = ws.ChartObjects().Add(0, 0, width, height)
+                chart = chobj.Chart
 
-                # Quick sanity: ensure the range exists
-                try:
-                    ws.Activate()
-                    rng = ws.Range(range_addr)
-                except com_error as e:
-                    log_step(f"ERROR accessing range '{range_addr}': {e}")
-                    raise
-
-                # Ensure something is actually visible to capture
-                if rng.Columns.Count == 0 or rng.Rows.Count == 0:
-                    raise RuntimeError(f"Empty range: {range_addr}")
-                if rng.Width == 0 or rng.Height == 0:
-                    log_step(f"WARNING: range has zero width/height (hidden columns/rows?).")
-
-                # Copy → Paste as SHAPE (robust path). Retry a few times for clipboard.
-                shape = None
-                for attempt in range(1, 6):
+                # Try a few times to get the picture onto the chart
+                exported = False
+                for _ in range(6):
                     try:
-                        log_step(f"[shot {i}] CopyPicture attempt {attempt}")
                         rng.CopyPicture(Appearance=1, Format=2)  # xlScreen=1, xlBitmap=2
                         pythoncom.PumpWaitingMessages()
-                        time.sleep(0.20)
-
-                        # Try modern paste: returns Shape directly in many builds
-                        try:
-                            shape = ws.Paste()
-                        except Exception:
-                            # Fallbacks if that failed
-                            try:
-                                shape = ws.Shapes.Paste()  # returns ShapeRange
-                                # Convert ShapeRange -> Shape via first item
-                                if hasattr(shape, "Item"):
-                                    shape = shape.Item(1)
-                            except Exception:
-                                pic = ws.Pictures().Paste()
-                                # Convert Picture -> Shape by grabbing last shape
-                                shape = ws.Shapes(ws.Shapes.Count)
-
-                        if not shape:
-                            raise RuntimeError("Paste returned no shape")
-
-                        # Size & position to match range (optional but neat)
-                        shape.Left = rng.Left
-                        shape.Top = rng.Top
-                        shape.Width = rng.Width
-                        shape.Height = rng.Height
-                        break
-                    except com_error as e:
-                        log_step(f"[shot {i}] COM error during copy/paste: {e}")
-                        time.sleep(0.3)
-                        shape = None
-                if not shape:
-                    # Fallback: chart-based capture (very reliable)
-                    log_step(f"[shot {i}] Falling back to chart export method")
-                    try:
-                        left, top, width, height = 0, 0, rng.Width, rng.Height
-                        chart_obj = ws.ChartObjects().Add(left, top, width, height)
-                        chart = chart_obj.Chart
-                        rng.CopyPicture(Appearance=1, Format=2)
-                        pythoncom.PumpWaitingMessages()
-                        time.sleep(0.15)
-                        chart.Paste()
+                        time.sleep(0.18)
+                        chart.Paste()  # paste the bitmap onto the chart
                         out_path = Path(tempfile.gettempdir()) / out_name
                         chart.Export(str(out_path), "PNG")
-                        chart_obj.Delete()
-                        paths.append(str(out_path))
-                        continue
-                    except com_error as e:
-                        log_step(f"[shot {i}] Fallback chart export FAILED: {e}")
-                        raise
+                        # sanity: tiny files often mean blank export
+                        if out_path.exists() and out_path.stat().st_size > 1024:
+                            exported = True
+                            paths.append(str(out_path))
+                            break
+                        time.sleep(0.2)
+                    except com_error:
+                        time.sleep(0.25)
 
-                # Primary path: export the Shape directly
+                # Clean up chart regardless
                 try:
-                    out_path = Path(tempfile.gettempdir()) / out_name
-                    log_step(f"[shot {i}] Exporting shape to {out_path}")
-                    shape.Export(str(out_path))
-                    # Rudimentary blank check (<1 KB often means empty)
-                    try:
-                        if out_path.exists() and out_path.stat().st_size < 1024:
-                            log_step(f"[shot {i}] WARNING: tiny PNG ({out_path.stat().st_size} bytes)—may be blank.")
-                    except Exception:
-                        pass
-                    paths.append(str(out_path))
-                except com_error as e:
-                    log_step(f"[shot {i}] Shape.Export COM error: {e}. Trying chart fallback…")
-                    # Chart fallback if shape export borks for this build
-                    try:
-                        # Make sure we still have the bitmap on clipboard
-                        rng.CopyPicture(Appearance=1, Format=2)
-                        pythoncom.PumpWaitingMessages()
-                        time.sleep(0.15)
-                        chart_obj = ws.ChartObjects().Add(0, 0, rng.Width, rng.Height)
-                        chart = chart_obj.Chart
-                        chart.Paste()
-                        out_path = Path(tempfile.gettempdir()) / out_name
-                        chart.Export(str(out_path), "PNG")
-                        chart_obj.Delete()
-                        paths.append(str(out_path))
-                    finally:
-                        try:
-                            shape.Delete()
-                        except Exception:
-                            pass
-                else:
-                    # Clean up the pasted shape
-                    try:
-                        shape.Delete()
-                    except Exception:
-                        pass
+                    chobj.Delete()
+                except Exception:
+                    pass
 
-            try:
-                wb.Close(SaveChanges=False)
-            except com_error as e:
-                log_step(f"WARNING closing workbook: {e}")
+                if not exported:
+                    raise RuntimeError(f"Failed to export {sheet_name or '(ActiveSheet)'}!{range_addr}")
 
+            wb.Close(SaveChanges=False)
         finally:
             try:
                 excel.ScreenUpdating = True
