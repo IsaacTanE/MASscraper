@@ -59,21 +59,18 @@ def export_range_as_pngs(excel_path, shots):
             for sheet_name, range_addr, out_name in shots:
                 ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
 
-                # Activate sheet and select range so CopyPicture has context
                 ws.Activate()
                 rng = ws.Range(range_addr)
                 rng.Select()
 
-                # Copy as picture with a short retry loop for reliability
+                # Retry loop for clipboard reliability
                 ok = False
                 for _ in range(5):
                     try:
                         rng.CopyPicture(Appearance=1, Format=2)  # xlScreen=1, xlBitmap=2
-                        # Let clipboard settle
                         pythoncom.PumpWaitingMessages()
                         time.sleep(0.15)
-                        # Paste as a PICTURE shape on the sheet
-                        pic = ws.Pictures().Paste()
+                        pic = ws.Paste()  # Paste returns a Shape in modern Excel
                         ok = True
                         break
                     except Exception:
@@ -82,19 +79,25 @@ def export_range_as_pngs(excel_path, shots):
                 if not ok:
                     raise RuntimeError(f"Failed to capture range {range_addr} as picture.")
 
-                # Size the picture to match the range bounds (optional but neat)
-                pic.Left = rng.Left
-                pic.Top = rng.Top
-                pic.Width = rng.Width
-                pic.Height = rng.Height
+                # Get the pasted shape — Paste() returns the shape object directly in newer versions
+                if hasattr(pic, "Name"):
+                    shape = ws.Shapes(pic.Name)
+                else:
+                    # Fallback: assume it's the last shape on the sheet
+                    shape = ws.Shapes(ws.Shapes.Count)
 
-                # Export the picture shape directly (more reliable than exporting a chart)
+                # Position/size neatly over the range
+                shape.Left = rng.Left
+                shape.Top = rng.Top
+                shape.Width = rng.Width
+                shape.Height = rng.Height
+
+                # Export shape directly
                 out_path = Path(tempfile.gettempdir()) / out_name
-                # Shape.Export needs a filter; "PNG" works for pictures
-                pic.ShapeRange.Export(str(out_path), 2)  # 2 = ppShapeFormatPNG
+                shape.Export(str(out_path))  # Export is available on Shapes
 
-                # Clean up the pasted picture from the sheet
-                pic.Delete()
+                # Delete pasted shape from sheet
+                shape.Delete()
 
                 paths.append(str(out_path))
 
