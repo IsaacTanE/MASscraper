@@ -1,75 +1,158 @@
 # -*- coding: utf-8 -*-
-# Requirements: pip install pywin32
-# Works on Windows with desktop Excel + Outlook installed and signed in.
+# Windows + Office desktop. Install: pip install pywin32
 
 import tempfile
 from pathlib import Path
+from contextlib import contextmanager
+import pythoncom
 import win32com.client as win32
 
+# ====== CONFIGURE THESE ======
 EXCEL_PATH = r"C:\path\to\your\workbook.xlsx"   # <- change me
-SHEET_NAME = None                                # e.g. "Sheet1" or None for ActiveSheet
-RANGE_ADDR = "A1:E40"                            # the range to screenshot
+SHEET1_NAME = None                               # e.g. "Sheet1"; or None = ActiveSheet
+RANGE1_ADDR = "A1:E40"
 
-def export_range_as_png(excel_path, range_addr="A1:E40", sheet_name=None, out_path=None):
-    """Exports an Excel range as a PNG by copying it into a temporary chart and exporting."""
-    excel = win32.gencache.EnsureDispatch("Excel.Application")
-    excel.Visible = False
+SHEET2_NAME = "Yield"
+RANGE2_ADDR = "L1:Q27"
+
+TARGET_SUBJECT = "RE: SGS Portfolios and B-S (11/08/2025)"
+TARGET_SENDER_SMTP = "isaactane@dbs.com"         # since it's in Sent Items
+# =============================
+
+@contextmanager
+def com_apartment():
+    pythoncom.CoInitialize()
     try:
-        wb = excel.Workbooks.Open(excel_path)
-        ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
-
-        rng = ws.Range(range_addr)
-        # Copy the range as a picture (screen appearance, bitmap format)
-        rng.CopyPicture(Appearance=1, Format=2)  # 1=xlScreen, 2=xlBitmap
-
-        # Drop a temporary chart exactly sized to the range, paste, then export
-        # Left, Top in points from sheet's top-left. Width/Height also in points.
-        left, top, width, height = 0, 0, rng.Width, rng.Height
-        chart_obj = ws.ChartObjects().Add(left, top, width, height)
-        chart = chart_obj.Chart
-        chart.Paste()
-        out_path = Path(out_path) if out_path else Path(tempfile.gettempdir()) / "excel_range.png"
-        chart.Export(str(out_path), "PNG")
-
-        # Clean up the temporary chart
-        chart_obj.Delete()
-        wb.Close(SaveChanges=False)
-        return str(out_path)
+        yield
     finally:
-        excel.Quit()
+        pythoncom.CoUninitialize()
 
-def reply_with_inline_image(image_path):
-    """Replies to the currently selected email in Outlook and inserts the image at the top."""
+def export_range_as_pngs(excel_path, shots):
+    """
+    Export multiple ranges to PNGs using a dedicated Excel instance so we only close what we opened.
+    shots: list of tuples (sheet_name_or_None, range_addr, output_filename)
+    Returns: list of file paths
+    """
+    with com_apartment():
+        # DispatchEx -> starts a NEW Excel instance (won’t interfere with an existing one)
+        excel = win32.DispatchEx("Excel.Application")
+        excel.Visible = False
+        paths = []
+        try:
+            wb = excel.Workbooks.Open(excel_path)
+            for sheet_name, range_addr, out_name in shots:
+                ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
+                rng = ws.Range(range_addr)
+                rng.CopyPicture(Appearance=1, Format=2)  # 1=xlScreen, 2=xlBitmap
+
+                # Paste into a temp chart sized to the range, then export as PNG
+                left, top, width, height = 0, 0, rng.Width, rng.Height
+                chart_obj = ws.ChartObjects().Add(left, top, width, height)
+                chart = chart_obj.Chart
+                chart.Paste()
+
+                out_path = Path(tempfile.gettempdir()) / out_name
+                chart.Export(str(out_path), "PNG")
+                chart_obj.Delete()
+                paths.append(str(out_path))
+
+            # Close ONLY the workbook we opened; do not save changes
+            wb.Close(SaveChanges=False)
+        finally:
+            # Quit this private Excel instance (safe—does not close user’s other workbooks)
+            excel.Quit()
+        return paths
+
+def _sender_smtp(mail):
+    """Best-effort to get SMTP of the sender (handles Exchange)."""
+    try:
+        if mail.SenderEmailType == "EX":
+            exuser = mail.Sender.GetExchangeUser()
+            if exuser:
+                return exuser.PrimarySmtpAddress
+        return mail.SenderEmailAddress
+    except Exception:
+        return None
+
+def find_sent_item(subject_exact, sender_smtp=None):
+    """Find the most recent item in Sent Items matching the exact subject and (optionally) sender SMTP."""
     outlook = win32.gencache.EnsureDispatch("Outlook.Application")
-    explorer = outlook.ActiveExplorer()
-    if explorer is None or explorer.Selection.Count == 0:
-        raise RuntimeError("Open Outlook and select the email thread first, then run this script.")
+    ns = outlook.GetNamespace("MAPI")
+    sent_folder = ns.GetDefaultFolder(5)  # olFolderSentMail
 
-    original = explorer.Selection.Item(1)  # first selected item
-    reply = original.Reply()
-    reply.Display()  # show the draft so you can review/send
+    items = sent_folder.Items
+    items.Sort("[SentOn]", True)
 
-    # Use WordEditor to insert the image inline at the very top of the reply body
-    inspector = reply.GetInspector
-    doc = inspector.WordEditor  # Word Document
-    top_range = doc.Range(0, 0)
-    top_range.InsertAfter("See screenshot below:\r\n")
-    # Insert image right after the inserted line
-    insert_at = doc.Range(0, len("See screenshot below:\r\n"))
-    doc.InlineShapes.AddPicture(FileName=image_path, LinkToFile=False, SaveWithDocument=True, Range=insert_at)
+    safe_subject = subject_exact.replace('"', '""')
+    restricted = items.Restrict(f'[Subject] = "{safe_subject}"')
 
-    # Optionally add an extra newline after the image for spacing
-    after_img = doc.Range(insert_at.End, insert_at.End)
-    after_img.InsertAfter("\r\n")
+    for itm in restricted:
+        try:
+            if itm.Class != 43:  # 43 = olMail
+                continue
+            if sender_smtp:
+                smtp = _sender_smtp(itm)
+                if smtp and smtp.lower() != sender_smtp.lower():
+                    continue
+            return itm
+        except Exception:
+            continue
 
-    # Leave the window open for you to press Send manually
-    return reply
+    raise RuntimeError("No matching message found in Sent Items. Check subject and sender.")
+
+def reply_with_two_images(subject_exact, sender_smtp, img1_path, img2_path):
+    """Open a Reply to the specific Sent Items message and paste img2 below img1."""
+    with com_apartment():
+        original = find_sent_item(subject_exact, sender_smtp)
+        reply = original.Reply()
+        reply.Display()
+
+        inspector = reply.GetInspector
+        doc = inspector.WordEditor  # Word Document
+
+        # Intro text
+        intro = "See screenshots below:\r\n"
+        doc.Range(0, 0).InsertAfter(intro)
+
+        # Insert first image right after intro
+        r1 = doc.Range(0, len(intro))
+        doc.InlineShapes.AddPicture(
+            FileName=img1_path, LinkToFile=False, SaveWithDocument=True, Range=r1
+        )
+
+        # New line after first image
+        after_first = doc.Range(r1.End, r1.End)
+        after_first.InsertAfter("\r\n")
+
+        # Insert second image BELOW the first (after the newline)
+        r2 = doc.Range(after_first.End, after_first.End)
+        doc.InlineShapes.AddPicture(
+            FileName=img2_path, LinkToFile=False, SaveWithDocument=True, Range=r2
+        )
+
+        # Optional extra spacing
+        doc.Range(r2.End, r2.End).InsertAfter("\r\n")
+        return reply
 
 def main():
-    png_path = export_range_as_png(EXCEL_PATH, RANGE_ADDR, SHEET_NAME)
-    print(f"Saved image to: {png_path}")
-    reply_with_inline_image(png_path)
-    print("Reply draft opened in Outlook with the image inserted. Review and press Send manually.")
+    # Export both screenshots
+    img1_name = "excel_range_1.png"
+    img2_name = "excel_range_2.png"
+    paths = export_range_as_pngs(
+        EXCEL_PATH,
+        [
+            (SHEET1_NAME, RANGE1_ADDR, img1_name),         # e.g., ActiveSheet A1:E40
+            (SHEET2_NAME, RANGE2_ADDR, img2_name),         # Yield!L1:Q27
+        ],
+    )
+    img1_path, img2_path = paths
+
+    print(f"Saved image 1 to: {img1_path}")
+    print(f"Saved image 2 to: {img2_path}")
+
+    # Reply to the exact message and embed images
+    reply_with_two_images(TARGET_SUBJECT, TARGET_SENDER_SMTP, img1_path, img2_path)
+    print("Reply draft opened with both images pasted. Review and press Send manually.")
 
 if __name__ == "__main__":
     main()
