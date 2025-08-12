@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+# Requirements: pip install pywin32
+# Windows + desktop Outlook/Excel
+
 import tempfile
 from pathlib import Path
 from contextlib import contextmanager
@@ -9,14 +12,14 @@ import win32com.client as win32
 
 # ====== CONFIGURE ======
 EXCEL_PATH = r"C:\path\to\your\workbook.xlsx"   # <- change me
-SHEET_NAME = None                                # None = ActiveSheet
+SHEET_NAME = None                                # e.g. "Sheet1"; None = ActiveSheet
 RANGE_ADDR = "A1:E40"
 
 YIELD_SHEET = "Yield"
 YIELD_CELL = "L3"
 
-TARGET_SENDER_SMTP = "isaactane@dbs.com"         # it's in Sent Items
-HOLIDAYS = set()                                 # optional: {"2025-01-01", ...}
+TARGET_SENDER_SMTP = "isaactane@dbs.com"         # since it's in Sent Items
+HOLIDAYS = set()                                 # e.g. {"2025-01-01","2025-08-09"}
 # =======================
 
 @contextmanager
@@ -33,84 +36,54 @@ def last_business_day(ref=None):
         d -= timedelta(days=1)
     return d
 
+# === ORIGINAL (working) screenshot approach, with a private Excel instance ===
 def export_range_png_one(excel_path, sheet_name, range_addr, out_name="excel_range.png"):
-    """
-    Robust export that avoids blank images:
-      - make Excel visible and foreground (just during capture)
-      - copy as metafile (xlPicture) instead of bitmap
-      - paste into a temp chart and export
-    """
+    """Copy range -> paste into temp chart -> export PNG. Closes only what it opened."""
     import time
     with com_apartment():
-        xl = win32.DispatchEx("Excel.Application")
-        # MAKE IT VISIBLE so Windows actually renders the range
-        xl.Visible = True
-        xl.ScreenUpdating = True
-        xl.DisplayAlerts = False
+        excel = win32.DispatchEx("Excel.Application")   # private instance
+        excel.Visible = False
         try:
-            wb = xl.Workbooks.Open(excel_path)
+            wb = excel.Workbooks.Open(excel_path)
             ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
-            ws.Activate()
-
-            # Make sure the window can render (not minimized/offscreen)
-            try:
-                xl.ActiveWindow.WindowState = -4143  # xlNormal
-            except Exception:
-                pass
-            try:
-                xl.ActiveWindow.Zoom = 100
-            except Exception:
-                pass
-
             rng = ws.Range(range_addr)
-            # Scroll the range into view so CopyPicture has real pixels to grab
-            ws.Application.Goto(rng, Scroll=True)
-            time.sleep(0.3)
 
-            # Create a temp chart sized to the range
-            width, height = max(2, int(rng.Width)), max(2, int(rng.Height))
-            chobj = ws.ChartObjects().Add(0, 0, width, height)
-            chart = chobj.Chart
+            # Copy as picture (screen, bitmap)
+            rng.CopyPicture(Appearance=1, Format=2)  # 1=xlScreen, 2=xlBitmap
+
+            # Temp chart sized to the range, then paste and export
+            left, top, width, height = 0, 0, rng.Width, rng.Height
+            chart_obj = ws.ChartObjects().Add(left, top, width, height)
+            chart = chart_obj.Chart
+
+            # Small pause so clipboard is ready
+            pythoncom.PumpWaitingMessages()
+            time.sleep(0.15)
+            chart.Paste()
 
             out_path = Path(tempfile.gettempdir()) / out_name
-            ok = False
-            # Use xlPicture (-4147) metafile; more reliable than xlBitmap(2)
-            for _ in range(6):
-                rng.CopyPicture(Appearance=1, Format=-4147)  # xlScreen=1, xlPicture=-4147
-                pythoncom.PumpWaitingMessages()
-                time.sleep(0.35)  # give clipboard time
-                chart.Paste()
-                chart.Export(str(out_path), "PNG")
-                if out_path.exists() and out_path.stat().st_size > 1024:
-                    ok = True
-                    break
-                time.sleep(0.35)
+            chart.Export(str(out_path), "PNG")
 
-            chobj.Delete()
-            if not ok:
-                raise RuntimeError(f"Failed to export visible image for {range_addr}")
+            # Clean up
+            chart_obj.Delete()
+            wb.Close(SaveChanges=False)
             return str(out_path)
         finally:
-            try:
-                wb.Close(SaveChanges=False)
-            except Exception:
-                pass
-            # you can set xl.Visible=False here if you don't want to see Excel linger
-            xl.Quit()
+            excel.Quit()
 
 def read_cell(excel_path, sheet_name, cell_addr):
-    """Read a single cell value (no side effects)."""
+    """Read a single cell value from a fresh, private Excel instance."""
     with com_apartment():
-        xl = win32.DispatchEx("Excel.Application")
-        xl.Visible = False
+        excel = win32.DispatchEx("Excel.Application")
+        excel.Visible = False
         try:
-            wb = xl.Workbooks.Open(excel_path)
+            wb = excel.Workbooks.Open(excel_path)
             ws = wb.Worksheets(sheet_name)
             val = ws.Range(cell_addr).Value
             wb.Close(SaveChanges=False)
             return val
         finally:
-            xl.Quit()
+            excel.Quit()
 
 def _sender_smtp(mail):
     try:
@@ -128,7 +101,6 @@ def _restrict_contains(items, contains_text):
     try:
         return items.Restrict(dasl)
     except Exception:
-        # Fallback loop if DASL not allowed
         return [itm for itm in items if hasattr(itm, "Subject") and contains_text.lower() in (itm.Subject or "").lower()]
 
 def find_sent_item_contains(subject_contains, sender_smtp=None, fallback_contains=None):
@@ -136,7 +108,7 @@ def find_sent_item_contains(subject_contains, sender_smtp=None, fallback_contain
     ns = outlook.GetNamespace("MAPI")
     sent = ns.GetDefaultFolder(5)  # olFolderSentMail
     items = sent.Items
-    items.Sort("[SentOn]", True)  # newest first
+    items.Sort("[SentOn]", True)   # newest first
 
     for snippet in (subject_contains, fallback_contains):
         if not snippet:
@@ -156,38 +128,39 @@ def find_sent_item_contains(subject_contains, sender_smtp=None, fallback_contain
 
 def reply_with_image_and_text(img_path, text_below, subject_contains, sender_smtp, fallback_contains=None):
     with com_apartment():
+        outlook = win32.gencache.EnsureDispatch("Outlook.Application")
         original = find_sent_item_contains(subject_contains, sender_smtp, fallback_contains)
         reply = original.Reply()
         reply.Display()
 
         doc = reply.GetInspector.WordEditor  # Word document
+
         intro = "See screenshot and value below:\r\n"
         doc.Range(0, 0).InsertAfter(intro)
 
         r_img = doc.Range(0, len(intro))
         doc.InlineShapes.AddPicture(FileName=img_path, LinkToFile=False, SaveWithDocument=True, Range=r_img)
 
-        # newline + value below
         after = doc.Range(r_img.End, r_img.End)
         after.InsertAfter("\r\n")
         doc.Range(after.End, after.End).InsertAfter(f"L3 (Yield): {text_below}\r\n")
         return reply
 
 def main():
-    # Build subject snippet for last business day
+    # Subject snippet for the last business day (handles weekends; add holidays in HOLIDAYS to skip)
     last_bd = last_business_day()
     date_str = last_bd.strftime("%d/%m/%Y")
     base_phrase = "SGS Portfolios and B-S ("
     subject_contains = f"{base_phrase}{date_str})"
-    fallback_contains = base_phrase  # if date-specific fails
+    fallback_contains = base_phrase
 
-    # 1) Screenshot A1:E40
-    png_path = export_range_png_one(EXCEL_PATH, SHEET_NAME, RANGE_ADDR, "excel_range_1.png")
+    # 1) Screenshot A1:E40 using the original working method
+    png_path = export_range_png_one(EXCEL_PATH, SHEET_NAME, RANGE_ADDR, "excel_range.png")
 
     # 2) Read Yield!L3
     l3_val = read_cell(EXCEL_PATH, YIELD_SHEET, YIELD_CELL)
 
-    # 3) Reply and paste image + value
+    # 3) Reply and paste image + L3 value
     reply_with_image_and_text(
         png_path,
         l3_val,
