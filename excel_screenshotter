@@ -43,33 +43,69 @@ def last_business_day(ref_dt=None, holidays=None):
     return d
 
 def export_range_as_pngs(excel_path, shots):
-    """Export multiple ranges to PNGs using a dedicated Excel instance so we only close what we opened."""
+    """
+    Export multiple ranges to PNGs using a dedicated Excel instance; closes only what we opened.
+    shots: list of tuples (sheet_name_or_None, range_addr, output_filename)
+    Returns: list[str] of file paths
+    """
+    import time
     with com_apartment():
-        excel = win32.DispatchEx("Excel.Application")  # separate Excel instance
+        excel = win32.DispatchEx("Excel.Application")  # isolated instance
         excel.Visible = False
+        excel.ScreenUpdating = False
         paths = []
         try:
             wb = excel.Workbooks.Open(excel_path)
             for sheet_name, range_addr, out_name in shots:
                 ws = wb.Worksheets(sheet_name) if sheet_name else wb.ActiveSheet
+
+                # Activate sheet and select range so CopyPicture has context
+                ws.Activate()
                 rng = ws.Range(range_addr)
-                rng.CopyPicture(Appearance=1, Format=2)  # xlScreen=1, xlBitmap=2
+                rng.Select()
 
-                left, top, width, height = 0, 0, rng.Width, rng.Height
-                chart_obj = ws.ChartObjects().Add(left, top, width, height)
-                chart = chart_obj.Chart
-                chart.Paste()
+                # Copy as picture with a short retry loop for reliability
+                ok = False
+                for _ in range(5):
+                    try:
+                        rng.CopyPicture(Appearance=1, Format=2)  # xlScreen=1, xlBitmap=2
+                        # Let clipboard settle
+                        pythoncom.PumpWaitingMessages()
+                        time.sleep(0.15)
+                        # Paste as a PICTURE shape on the sheet
+                        pic = ws.Pictures().Paste()
+                        ok = True
+                        break
+                    except Exception:
+                        time.sleep(0.2)
 
+                if not ok:
+                    raise RuntimeError(f"Failed to capture range {range_addr} as picture.")
+
+                # Size the picture to match the range bounds (optional but neat)
+                pic.Left = rng.Left
+                pic.Top = rng.Top
+                pic.Width = rng.Width
+                pic.Height = rng.Height
+
+                # Export the picture shape directly (more reliable than exporting a chart)
                 out_path = Path(tempfile.gettempdir()) / out_name
-                chart.Export(str(out_path), "PNG")
-                chart_obj.Delete()
+                # Shape.Export needs a filter; "PNG" works for pictures
+                pic.ShapeRange.Export(str(out_path), 2)  # 2 = ppShapeFormatPNG
+
+                # Clean up the pasted picture from the sheet
+                pic.Delete()
+
                 paths.append(str(out_path))
 
-            wb.Close(SaveChanges=False)  # close only this workbook
+            wb.Close(SaveChanges=False)
         finally:
-            excel.Quit()  # close only this instance of Excel
+            try:
+                excel.ScreenUpdating = True
+            except Exception:
+                pass
+            excel.Quit()
         return paths
-
 def _sender_smtp(mail):
     """Best-effort to get SMTP of the sender (handles Exchange)."""
     try:
