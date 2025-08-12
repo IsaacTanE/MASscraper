@@ -44,9 +44,8 @@ def last_business_day(ref_dt=None, holidays=None):
 
 def export_range_as_pngs(excel_path, shots):
     """
-    Robust export using a temporary ChartObject only (no Shape/Picture paste).
-    shots: list of tuples (sheet_name_or_None, range_addr, output_filename)
-    Returns: list[str] of file paths
+    Export multiple ranges to PNGs using a dedicated Excel instance; closes only what we opened.
+    One range at a time to avoid clipboard overwriting.
     """
     import time
     from pythoncom import com_error
@@ -64,31 +63,30 @@ def export_range_as_pngs(excel_path, shots):
                 ws.Activate()
                 rng = ws.Range(range_addr)
 
-                # Create a temp chart sized to the range
+                # Create chart sized to range
                 width, height = max(2, int(rng.Width)), max(2, int(rng.Height))
                 chobj = ws.ChartObjects().Add(0, 0, width, height)
                 chart = chobj.Chart
 
-                # Try a few times to get the picture onto the chart
+                # Retry loop for reliability
                 exported = False
-                for _ in range(6):
+                for attempt in range(6):
                     try:
                         rng.CopyPicture(Appearance=1, Format=2)  # xlScreen=1, xlBitmap=2
                         pythoncom.PumpWaitingMessages()
-                        time.sleep(0.18)
-                        chart.Paste()  # paste the bitmap onto the chart
+                        time.sleep(0.3)  # give clipboard time to settle
+                        chart.Paste()
                         out_path = Path(tempfile.gettempdir()) / out_name
                         chart.Export(str(out_path), "PNG")
-                        # sanity: tiny files often mean blank export
                         if out_path.exists() and out_path.stat().st_size > 1024:
                             exported = True
                             paths.append(str(out_path))
                             break
-                        time.sleep(0.2)
+                        time.sleep(0.3)
                     except com_error:
-                        time.sleep(0.25)
+                        time.sleep(0.3)
 
-                # Clean up chart regardless
+                # Clean up this chart before the next loop
                 try:
                     chobj.Delete()
                 except Exception:
@@ -96,6 +94,9 @@ def export_range_as_pngs(excel_path, shots):
 
                 if not exported:
                     raise RuntimeError(f"Failed to export {sheet_name or '(ActiveSheet)'}!{range_addr}")
+
+                # Give Excel a short rest before starting next screenshot
+                time.sleep(0.5)
 
             wb.Close(SaveChanges=False)
         finally:
@@ -109,7 +110,6 @@ def export_range_as_pngs(excel_path, shots):
                 pass
 
         return paths
-
 
 def _sender_smtp(mail):
     """Best-effort to get SMTP of the sender (handles Exchange)."""
