@@ -311,3 +311,158 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+new function
+
+import time
+
+# MAPI property tags
+PR_SENDER_EMAIL_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x0065001E"
+
+def _smtp_from_mail(item):
+    """Resolve sender SMTP robustly for a MailItem."""
+    try:
+        if item.SenderEmailType == "EX":
+            exu = item.Sender.GetExchangeUser()
+            if exu and exu.PrimarySmtpAddress:
+                return exu.PrimarySmtpAddress
+        return item.SenderEmailAddress
+    except Exception:
+        # Last-resort try via PropertyAccessor (may still be X.500 on some profiles)
+        try:
+            return item.PropertyAccessor.GetProperty(PR_SENDER_EMAIL_ADDRESS)
+        except Exception:
+            return None
+
+def _build_dasl_filter(subject_snippet, sender_smtp):
+    """
+    Build a DASL filter that matches:
+      (Subject LIKE '%snippet%' OR ConversationTopic LIKE '%snippet%')
+      AND (fromemail == sender OR PR_SENDER_EMAIL_ADDRESS == sender)
+    Case-insensitive LIKE is okay in DASL.
+    """
+    esc_subj = subject_snippet.replace("'", "''")
+    esc_sender = sender_smtp.replace("'", "''")
+    return (
+        f'@SQL=('
+        f'  "urn:schemas:httpmail:subject" LIKE \'%{esc_subj}%\' '
+        f'  OR "urn:schemas:httpmail:conversationtopic" LIKE \'%{esc_subj}%\''
+        f') AND ('
+        f'  "urn:schemas:httpmail:fromemail" = \'{esc_sender}\' '
+        f'  OR "{PR_SENDER_EMAIL_ADDRESS}" = \'{esc_sender}\''
+        f')'
+    )
+
+def _advanced_search_inbox(outlook, dasl_filter, tag="__search__", timeout_sec=6.0):
+    """
+    Run AdvancedSearch over Inbox (including subfolders). Wait up to timeout_sec for results.
+    Returns a Results collection (possibly empty).
+    """
+    ns = outlook.GetNamespace("MAPI")
+    inbox = ns.GetDefaultFolder(6)  # olFolderInbox
+    scope = inbox.FolderPath  # e.g. "\\Mailbox - You\\Inbox"
+    # AdvancedSearch(scope, Filter, SearchSubFolders, Tag)
+    srch = outlook.AdvancedSearch(scope, dasl_filter, True, tag)
+    # Wait briefly for query to execute (poll results)
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            res = srch.Results
+            # AdvancedSearch returns a Results collection that updates; we can break early if it has items
+            if res and res.Count is not None:
+                return res
+        except Exception:
+            pass
+        time.sleep(0.15)
+    return srch.Results  # return whatever we have
+
+def find_inbox_item_contains_by_sender(subject_contains, sender_smtp, fallback_contains=None, max_take=1):
+    """
+    Find the newest Inbox (or subfolder) message FROM sender_smtp whose Subject/ConversationTopic contains snippet.
+    Tries the dated snippet first, then the fallback snippet.
+    Returns a MailItem; raises RuntimeError if not found.
+    """
+    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+
+    # Try dated snippet first
+    for snippet in [subject_contains, fallback_contains]:
+        if not snippet:
+            continue
+
+        # 1) Fast path: AdvancedSearch with wide DASL (subject OR conversationtopic, 2 sender props)
+        dasl = _build_dasl_filter(snippet, sender_smtp)
+        results = _advanced_search_inbox(outlook, dasl_filter=dasl, timeout_sec=6.0)
+        # Results are not guaranteed sorted; pick the newest by ReceivedTime
+        candidates = []
+        try:
+            for i in range(1, results.Count + 1):
+                itm = results.Item(i)
+                if getattr(itm, "Class", None) != 43:  # olMail only
+                    continue
+                candidates.append(itm)
+        except Exception:
+            candidates = []
+
+        if candidates:
+            # Sort by ReceivedTime desc
+            try:
+                candidates.sort(key=lambda m: getattr(m, "ReceivedTime", None), reverse=True)
+            except Exception:
+                pass
+            # Return first
+            return candidates[0]
+
+        # 2) Fallback: manual scan over Inbox + subfolders (top ~400 items total)
+        ns = outlook.GetNamespace("MAPI")
+        inbox = ns.GetDefaultFolder(6)
+        to_visit = [inbox]
+        try:
+            to_visit.extend(list(inbox.Folders))
+        except Exception:
+            pass
+
+        examined = 0
+        newest = None
+        newest_time = None
+
+        for folder in to_visit:
+            try:
+                items = folder.Items
+                items.Sort("[ReceivedTime]", True)
+            except Exception:
+                continue
+            # Scan only the most recent slice for speed
+            count = min(getattr(items, "Count", 0), 400)
+            for i in range(1, count + 1):
+                itm = items.Item(i)
+                try:
+                    if getattr(itm, "Class", None) != 43:
+                        continue
+                    subj = (itm.Subject or "")
+                    convo = getattr(itm, "ConversationTopic", "") or ""
+                    text = (subj + " " + convo).lower()
+                    if snippet.lower() not in text:
+                        continue
+                    smtp = (_smtp_from_mail(itm) or "").lower()
+                    if smtp != sender_smtp.lower():
+                        continue
+                    rt = getattr(itm, "ReceivedTime", None)
+                    if newest_time is None or (rt and rt > newest_time):
+                        newest, newest_time = itm, rt
+                    examined += 1
+                    if max_take and newest:
+                        # We already sort newest-first per folder; short-circuit
+                        return newest
+                except Exception:
+                    continue
+
+        # If we get here, no hit for this snippet; loop to try the fallback snippet
+        continue
+
+    # Nothing matched after both snippets
+    raise RuntimeError(
+        f"No Inbox email found from '{sender_smtp}' containing '{subject_contains}'"
+        + (f" (also tried '{fallback_contains}')" if fallback_contains else "")
+    )
