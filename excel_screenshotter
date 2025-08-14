@@ -466,3 +466,51 @@ def find_inbox_item_contains_by_sender(subject_contains, sender_smtp, fallback_c
         f"No Inbox email found from '{sender_smtp}' containing '{subject_contains}'"
         + (f" (also tried '{fallback_contains}')" if fallback_contains else "")
     )
+
+
+def find_inbox_simple(subject_contains, sender_smtp, fallback_contains=None):
+    """
+    Find the newest email in the TOP-LEVEL Inbox (no subfolders) where:
+      - Subject contains snippet (case-insensitive), and
+      - SenderEmailAddress == sender_smtp (SMTP form, not EX/X.500)
+    Tries the dated snippet first, then fallback snippet.
+    """
+    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+    ns = outlook.GetNamespace("MAPI")
+    inbox = ns.GetDefaultFolder(6)  # olFolderInbox
+    items = inbox.Items
+    items.Sort("[ReceivedTime]", True)  # newest first
+
+    def restrict_subject_sender(snippet):
+        if not snippet:
+            return []
+        # Try DASL restrict first (fast); fall back to manual loop if blocked
+        esc_subj = snippet.replace("'", "''")
+        esc_from = sender_smtp.replace("'", "''")
+        dasl = (
+            f'@SQL=("urn:schemas:httpmail:subject" LIKE \'%{esc_subj}%\') '
+            f'AND ("urn:schemas:httpmail:fromemail" = \'{esc_from}\')'
+        )
+        try:
+            return [itm for itm in items.Restrict(dasl) if getattr(itm, "Class", None) == 43]
+        except Exception:
+            buf = []
+            count = min(getattr(items, "Count", 0), 300)  # scan recent slice
+            for i in range(1, count + 1):
+                itm = items.Item(i)
+                if getattr(itm, "Class", None) != 43:
+                    continue
+                subj_ok = snippet.lower() in ((itm.Subject or "").lower())
+                from_ok = ((itm.SenderEmailAddress or "").lower() == sender_smtp.lower())
+                if subj_ok and from_ok:
+                    buf.append(itm)
+            return buf
+
+    for snippet in (subject_contains, fallback_contains):
+        for itm in restrict_subject_sender(snippet):
+            return itm
+
+    raise RuntimeError(
+        f"No Inbox email found from '{sender_smtp}' containing '{subject_contains}'"
+        + (f" (also tried '{fallback_contains}')" if fallback_contains else "")
+    )
