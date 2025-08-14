@@ -514,3 +514,44 @@ def find_inbox_simple(subject_contains, sender_smtp, fallback_contains=None):
         f"No Inbox email found from '{sender_smtp}' containing '{subject_contains}'"
         + (f" (also tried '{fallback_contains}')" if fallback_contains else "")
     )
+
+
+def find_inbox_by_subject(subject_contains, fallback_contains=None):
+    """
+    Find the newest email in the TOP-LEVEL Inbox (no subfolders)
+    where the Subject contains the snippet (case-insensitive).
+    Tries the dated snippet first, then fallback snippet.
+    """
+    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+    ns = outlook.GetNamespace("MAPI")
+    inbox = ns.GetDefaultFolder(6)  # olFolderInbox
+    items = inbox.Items
+    items.Sort("[ReceivedTime]", True)  # newest first
+
+    def restrict_subject(snippet):
+        if not snippet:
+            return []
+        # Try DASL restrict first (fast), else manual loop
+        esc_subj = snippet.replace("'", "''")
+        dasl = f'@SQL="urn:schemas:httpmail:subject" LIKE \'%{esc_subj}%\''
+        try:
+            return [itm for itm in items.Restrict(dasl) if getattr(itm, "Class", None) == 43]
+        except Exception:
+            buf = []
+            count = min(getattr(items, "Count", 0), 300)  # scan recent slice
+            for i in range(1, count + 1):
+                itm = items.Item(i)
+                if getattr(itm, "Class", None) != 43:
+                    continue
+                if snippet.lower() in ((itm.Subject or "").lower()):
+                    buf.append(itm)
+            return buf
+
+    for snippet in (subject_contains, fallback_contains):
+        for itm in restrict_subject(snippet):
+            return itm
+
+    raise RuntimeError(
+        f"No Inbox email found containing '{subject_contains}'"
+        + (f" (also tried '{fallback_contains}')" if fallback_contains else "")
+    )
