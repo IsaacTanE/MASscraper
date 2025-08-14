@@ -142,6 +142,74 @@ def export_range_png_one(excel_path, sheet_name, range_addr, out_name="excel_ran
             # If you prefer to keep Excel hidden afterward, toggle Visible=False here before Quit()
             xl.Quit()
 
+def find_inbox_item_contains_by_sender(subject_contains, sender_smtp, fallback_contains=None):
+    """
+    Find the newest email in Inbox where:
+      - Subject contains `subject_contains` (DASL LIKE, case-insensitive)
+      - Sender's SMTP address matches `sender_smtp`
+    Falls back to `fallback_contains` if the date-specific snippet isn't found.
+    """
+    outlook = win32.gencache.EnsureDispatch("Outlook.Application")
+    ns = outlook.GetNamespace("MAPI")
+    inbox = ns.GetDefaultFolder(6)  # 6 = olFolderInbox
+
+    items = inbox.Items
+    items.Sort("[ReceivedTime]", True)  # newest first
+
+    # Build a DASL query that matches Subject contains ... AND FromEmail equals ...
+    def restrict_subject_and_sender(snippet):
+        if not snippet:
+            return None
+        esc_subj = snippet.replace("'", "''")
+        esc_from = sender_smtp.replace("'", "''")
+        # urn:schemas:httpmail:fromemail is the SMTP address for most profiles
+        dasl = (
+            f'@SQL=("urn:schemas:httpmail:subject" LIKE \'%{esc_subj}%\') '
+            f'AND ("urn:schemas:httpmail:fromemail" = \'{esc_from}\')'
+        )
+        try:
+            return items.Restrict(dasl)
+        except Exception:
+            # Fallback: manual filter loop if DASL is blocked
+            buf = []
+            for itm in items:
+                try:
+                    if getattr(itm, "Class", None) != 43:  # olMail
+                        continue
+                    subj_ok = snippet.lower() in (itm.Subject or "").lower()
+                    # Try to resolve SMTP address
+                    smtp = None
+                    try:
+                        if itm.SenderEmailType == "EX":
+                            exuser = itm.Sender.GetExchangeUser()
+                            smtp = exuser.PrimarySmtpAddress if exuser else None
+                        else:
+                            smtp = itm.SenderEmailAddress
+                    except Exception:
+                        pass
+                    from_ok = (smtp or "").lower() == sender_smtp.lower()
+                    if subj_ok and from_ok:
+                        buf.append(itm)
+                except Exception:
+                    continue
+            return buf
+
+    for snippet in (subject_contains, fallback_contains):
+        candidates = restrict_subject_and_sender(snippet)
+        if candidates:
+            # Return the first (newest) candidate
+            for itm in candidates:
+                try:
+                    if itm.Class == 43:
+                        return itm
+                except Exception:
+                    continue
+
+    raise RuntimeError(
+        f"No Inbox email found from '{sender_smtp}' containing subject '{subject_contains}'."
+    )
+
+
 def read_cell(excel_path, sheet_name, cell_addr):
     """Read a single cell value from a fresh, private Excel instance."""
     with com_apartment():
