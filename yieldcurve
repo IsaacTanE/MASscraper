@@ -1,63 +1,282 @@
 import pandas as pd
 import numpy as np
-import plotly.express as px
 import plotly.graph_objects as go
+import plotly.express as px
+from sklearn.decomposition import PCA
+from pathlib import Path
 
 # ---------------- CONFIG ----------------
-file_path = r"C:\Users\You\curves.xlsx"   # <-- your Excel path
-sheet_name = "Sheet1"                     # <-- your sheet
+file_path  = r"C:\Users\You\curves.xlsx"   # <-- your Excel path
+sheet_name = "Sheet1"                      # <-- your sheet
+stirt_cap_years = 2.0                      # cap to ≤ 2Y
+export_html_dir = r"C:\Users\You\outputs"  # where to save HTMLs
+interp_missing_within_day = False          # True = fill gaps within a day; False = leave NaN
 # ----------------------------------------
 
-TENOR_MAP = {"O/N": 1/365, "ON": 1/365, "1D": 1/365,
-             "1W": 7/365, "2W": 14/365, "3W": 21/365,
-             "1M": 1/12, "2M": 2/12, "3M": 3/12,
-             "6M": 6/12, "9M": 9/12,
-             "12M": 1.0, "1Y": 1.0, "18M": 1.5, "2Y": 2.0}
+# Canonical STIRT tenor labels and mapping (≤ 2Y)
+CANON_LABELS = ["O/N","T/N","1W","2W","3W","1M","2M","3M","4M","5M","6M","9M","12M","15M","18M","2Y"]
+TENOR_MAP = {
+    "O/N": 1/365, "ON": 1/365, "1D": 1/365,
+    "T/N": 2/365, "TN": 2/365,                 # distinct from O/N so it plots between O/N and 1W
+    "1W": 7/365, "2W": 14/365, "3W": 21/365,
+    "1M": 1/12, "2M": 2/12, "3M": 3/12, "4M": 4/12, "5M": 5/12,
+    "6M": 6/12, "9M": 9/12,
+    "12M": 1.0, "1Y": 1.0, "15M": 15/12, "18M": 18/12,
+    "2Y": 2.0
+}
+CANON_TENORS = [TENOR_MAP[x] for x in CANON_LABELS]  # fixed x-axis in years
 
 def coerce_tenor_years(s):
     def _one(x):
         if pd.isna(x): return np.nan
         xs = str(x).strip().upper()
-        if xs in TENOR_MAP: return TENOR_MAP[xs]
-        if xs.endswith("M"): return float(xs[:-1])/12
-        if xs.endswith("Y"): return float(xs[:-1])
+        if xs in TENOR_MAP: return float(TENOR_MAP[xs])
+        if xs.endswith("M"):
+            try: return float(xs[:-1]) / 12.0
+            except: return np.nan
+        if xs.endswith("Y"):
+            try: return float(xs[:-1])
+            except: return np.nan
         try: return float(xs)
         except: return np.nan
     return s.apply(_one)
 
-# ---- LOAD ----
-df = pd.read_excel(file_path, sheet_name=sheet_name, dtype={"Tenor": object})
-df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+def reindex_to_canon(group, cols=("Sora","Sora_FX")):
+    """For a single date: put data on fixed tenor grid; optional linear interp across tenor."""
+    g = group.sort_values("TenorY")
+    # start with an empty frame at canonical x
+    base = pd.DataFrame({"TenorY": CANON_TENORS})
+    out = base.merge(g[["TenorY"] + list(cols)], on="TenorY", how="left")
+    if interp_missing_within_day:
+        for c in cols:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+            out[c] = out[c].interpolate("values", limit_direction="both")
+    out["Date"] = group["Date"].iloc[0]
+    return out[["Date","TenorY"] + list(cols)]
+
+# ---------- LOAD ----------
+df_raw = pd.read_excel(file_path, sheet_name=sheet_name, dtype={"Tenor": object})
+need = {"Date","Tenor","Sora","Sora_FX"}
+missing = need - set(df_raw.columns)
+if missing:
+    raise KeyError(f"Missing columns: {missing}. Found: {list(df_raw.columns)}")
+
+df = df_raw.copy()
+df["Date"]   = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
 df["TenorY"] = coerce_tenor_years(df["Tenor"])
-df = df.dropna(subset=["Date","TenorY","Sora","Sora_FX"])
-df = df[df["TenorY"] <= 2.0].sort_values(["Date","TenorY"]).reset_index(drop=True)
+df = df.dropna(subset=["Date","TenorY","Sora","Sora_FX"]).copy()
+df = df[df["TenorY"] <= stirt_cap_years]
 
-# ---- TODAY vs YDAY overlay (both curves) ----
-dates = sorted(df["Date"].unique())
-if len(dates) >= 2:
-    g0 = df[df["Date"] == dates[-2]]
-    g1 = df[df["Date"] == dates[-1]]
+# Reindex EVERY date onto the fixed tenor grid
+df = (df.groupby("Date", group_keys=False)
+        .apply(lambda g: reindex_to_canon(g, cols=("Sora","Sora_FX"))))
+
+# Basis (bp and %)
+df["Basis"] = df["Sora_FX"] - df["Sora"]
+df = df.sort_values(["Date","TenorY"]).reset_index(drop=True)
+
+dates = pd.Index(sorted(df["Date"].unique()))
+N = len(dates)
+tenor_min, tenor_max = min(CANON_TENORS), max(CANON_TENORS)
+
+# ---------- MAIN ANIMATED CHART (dual y, faded history, fixed axis) ----------
+def style_for(idx, current_idx):
+    if idx < current_idx:  return ("dot", 0.35, 2)
+    if idx == current_idx: return ("solid", 1.0, 3)
+    return ("solid", 0.0, 1)  # future hidden
+
+frames = []
+for i, d in enumerate(dates):
+    data_traces = []
+    # SORA traces
+    for j in range(N):
+        g = df[df["Date"] == dates[j]]
+        dash, opacity, width = style_for(j, i)
+        y = g["Sora"].values if j <= i else np.full_like(g["Sora"].values, np.nan)
+        data_traces.append(go.Scatter(
+            x=g["TenorY"], y=y, mode="lines+markers",
+            name=f"Sora {dates[j].date()}",
+            line=dict(dash=dash, width=width),
+            opacity=opacity, yaxis="y1",
+            hovertemplate=f"Date={dates[j].date()}<br>TenorY=%{{x}}<br>Sora=%{{y:.6f}}%<extra></extra>",
+            showlegend=(j == i)
+        ))
+    # SORA_FX traces
+    for j in range(N):
+        g = df[df["Date"] == dates[j]]
+        dash, opacity, width = style_for(j, i)
+        y = g["Sora_FX"].values if j <= i else np.full_like(g["Sora_FX"].values, np.nan)
+        data_traces.append(go.Scatter(
+            x=g["TenorY"], y=y, mode="lines+markers",
+            name=f"Sora_FX {dates[j].date()}",
+            line=dict(dash=dash, width=width),
+            opacity=opacity, yaxis="y2",
+            hovertemplate=f"Date={dates[j].date()}<br>TenorY=%{{x}}<br>Sora_FX=%{{y:.6f}}%<extra></extra>",
+            showlegend=(j == i)
+        ))
+    frames.append(go.Frame(name=dates[i].strftime("%Y-%m-%d"), data=data_traces))
+
+init_data = frames[-1].data
+fig_main = go.Figure(data=init_data, frames=frames)
+
+# Buttons: [0..N-1]=Sora, [N..2N-1]=Sora_FX
+buttons = [
+    dict(label="Show Sora only",
+         method="update",
+         args=[{"visible": [True]*N + [False]*N},
+               {"yaxis2": dict(overlaying="y", side="right", visible=False)}]),
+    dict(label="Show Sora_FX only",
+         method="update",
+         args=[{"visible": [False]*N + [True]*N},
+               {"yaxis2": dict(overlaying="y", side="right", visible=True)}]),
+    dict(label="Show Both",
+         method="update",
+         args=[{"visible": [True]*N + [True]*N},
+               {"yaxis2": dict(overlaying="y", side="right", visible=True)}]),
+]
+slider_steps = [
+    dict(method="animate",
+         label=dt.strftime("%Y-%m-%d"),
+         args=[[dt.strftime("%Y-%m-%d")],
+               {"mode":"immediate","frame":{"duration":0,"redraw":True},"transition":{"duration":0}}])
+    for dt in dates
+]
+
+fig_main.update_layout(
+    title=f"SORA vs SORA_FX (≤{stirt_cap_years}Y) — fixed tenor axis, faded history, slider, toggles",
+    xaxis=dict(title="Tenor (Years)", range=[tenor_min, tenor_max], tickmode="array", tickvals=CANON_TENORS),
+    yaxis=dict(title="Sora (%)"),
+    yaxis2=dict(title="Sora_FX (%)", overlaying="y", side="right", visible=True),
+    hovermode="x unified",
+    legend_title="Current curves",
+    updatemenus=[
+        dict(type="buttons", direction="left", x=0.0, y=1.20, xanchor="left", yanchor="top",
+             buttons=[
+                 dict(label="▶ Play",  method="animate", args=[None, {"fromcurrent": True, "frame":{"duration":0,"redraw":True},"transition":{"duration":0}}]),
+                 dict(label="⏸ Pause", method="animate", args=[[None], {"mode":"immediate","frame":{"duration":0,"redraw":False},"transition":{"duration":0}}]),
+             ]),
+        dict(type="buttons", direction="right", x=0.0, y=1.10, xanchor="left", yanchor="top", buttons=buttons),
+    ],
+    sliders=[dict(active=len(dates)-1, x=0.0, y=1.0, xanchor="left", yanchor="top",
+                  currentvalue={"prefix": "Date: "}, steps=slider_steps)]
+)
+Path(export_html_dir).mkdir(parents=True, exist_ok=True)
+fig_main.write_html(str(Path(export_html_dir)/"main_sora_vs_sorafx_FIXED.html"), include_plotlyjs="cdn")
+
+# ---------- BASIS CURVE (fixed axis, faded history) ----------
+frames_basis = []
+for i, d in enumerate(dates):
+    data_traces = []
+    for j in range(N):
+        g = df[df["Date"] == dates[j]]
+        dash, opacity, width = style_for(j, i)
+        y = (g["Basis"].values * 100.0) if j <= i else np.full_like(g["Basis"].values, np.nan)  # bp
+        data_traces.append(go.Scatter(
+            x=g["TenorY"], y=y, mode="lines+markers",
+            name=f"Basis {dates[j].date()}",
+            line=dict(dash=dash, width=width), opacity=opacity,
+            hovertemplate=f"Date={dates[j].date()}<br>TenorY=%{{x}}<br>Basis=%{{y:.2f}} bp<extra></extra>",
+            showlegend=(j == i)
+        ))
+    frames_basis.append(go.Frame(name=dates[i].strftime("%Y-%m-%d"), data=data_traces))
+
+fig_basis = go.Figure(data=frames_basis[-1].data, frames=frames_basis)
+fig_basis.update_layout(
+    title="FX Basis Term Structure (Sora_FX − Sora) — fixed tenor axis",
+    xaxis=dict(title="Tenor (Years)", range=[tenor_min, tenor_max], tickmode="array", tickvals=CANON_TENORS),
+    yaxis=dict(title="Basis (bp)"), hovermode="x unified",
+    updatemenus=[dict(type="buttons", direction="left", x=0.0, y=1.15,
+                      buttons=[
+                          dict(label="▶ Play", method="animate", args=[None, {"fromcurrent": True, "frame":{"duration":0,"redraw":True},"transition":{"duration":0}}]),
+                          dict(label="⏸ Pause", method="animate", args=[[None], {"mode":"immediate","frame":{"duration":0,"redraw":False},"transition":{"duration":0}}]),
+                      ])],
+    sliders=[dict(active=len(dates)-1, x=0.0, y=1.0, currentvalue={"prefix":"Date: "},
+                  steps=[dict(method="animate", label=dt.strftime("%Y-%m-%d"),
+                              args=[[dt.strftime("%Y-%m-%d")], {"mode":"immediate","frame":{"duration":0,"redraw":True},"transition":{"duration":0}}]) for dt in dates])]
+)
+fig_basis.write_html(str(Path(export_html_dir)/"basis_curve_FIXED.html"), include_plotlyjs="cdn")
+
+# ---------- HEATMAPS (fixed columns) ----------
+def fixed_pivot(df, value_col):
+    p = df.pivot_table(index="Date", columns="TenorY", values=value_col)
+    # reindex to canonical columns (fixed tenor axis)
+    p = p.reindex(columns=CANON_TENORS)
+    return p
+
+pivot_sora    = fixed_pivot(df, "Sora")
+pivot_sorafx  = fixed_pivot(df, "Sora_FX")
+pivot_basis   = fixed_pivot(df, "Basis")            # % units
+pivot_basis_bp = pivot_basis * 100.0
+pivot_basis_d_bp = pivot_basis_bp.diff()
+
+fig_basis_hm = px.imshow(pivot_basis_bp, origin="lower", aspect="auto", color_continuous_scale="RdBu_r",
+                         labels={"x":"Tenor (Years)","y":"Date","color":"Basis (bp)"},
+                         title="FX Basis Heatmap (bp) — Fixed Tenor Axis")
+fig_basis_hm.write_html(str(Path(export_html_dir)/"basis_heatmap_FIXED.html"), include_plotlyjs="cdn")
+
+fig_basis_d_hm = px.imshow(pivot_basis_d_bp, origin="lower", aspect="auto", color_continuous_scale="RdBu_r",
+                           labels={"x":"Tenor (Years)","y":"Date","color":"Δ Basis (bp)"},
+                           title="FX Basis Daily Change Heatmap (bp) — Fixed Tenor Axis")
+fig_basis_d_hm.write_html(str(Path(export_html_dir)/"basis_change_heatmap_FIXED.html"), include_plotlyjs="cdn")
+
+# ---------- SNAKE CHARTS (Δ bp, fixed x) ----------
+def snake_today_yday_fixed(pivot, title, fname):
+    chg_bp = pivot.diff().mul(100)
+    if chg_bp.shape[0] < 2:
+        return
+    last_two = chg_bp.iloc[-2:]
     fig = go.Figure()
-    # Sora curves
-    fig.add_trace(go.Scatter(x=g0["TenorY"], y=g0["Sora"], mode="lines+markers",
-                             name=f"Sora {dates[-2].date()}"))
-    fig.add_trace(go.Scatter(x=g1["TenorY"], y=g1["Sora"], mode="lines+markers",
-                             name=f"Sora {dates[-1].date()}"))
-    # Sora_FX curves
-    fig.add_trace(go.Scatter(x=g0["TenorY"], y=g0["Sora_FX"], mode="lines+markers",
-                             name=f"Sora_FX {dates[-2].date()}"))
-    fig.add_trace(go.Scatter(x=g1["TenorY"], y=g1["Sora_FX"], mode="lines+markers",
-                             name=f"Sora_FX {dates[-1].date()}"))
-    fig.update_layout(title="SORA vs SORA_FX – Today vs Yesterday",
-                      xaxis_title="Tenor (Years)", yaxis_title="Rate (%)")
-    fig.show()
+    for idx, (d, row) in enumerate(last_two.iterrows()):
+        fig.add_trace(go.Scatter(
+            x=list(row.index), y=row.values,
+            mode="lines+markers",
+            name=str(pd.to_datetime(d).date()),
+            line=dict(dash="dot" if idx == 0 else "solid", width=3 if idx == 1 else 2),
+            opacity=1.0 if idx == 1 else 0.6
+        ))
+    fig.update_layout(
+        title=title, xaxis_title="Tenor (Years)", yaxis_title="Δ (bp)",
+        xaxis=dict(tickmode="array", tickvals=CANON_TENORS),
+        hovermode="x unified"
+    )
+    fig.write_html(str(Path(export_html_dir)/fname), include_plotlyjs="cdn")
 
-# ---- Animation (both curves over time) ----
-df_long = df.melt(id_vars=["Date","TenorY"], value_vars=["Sora","Sora_FX"],
-                  var_name="Curve", value_name="Rate")
-df_long["DateStr"] = df_long["Date"].dt.strftime("%Y-%m-%d")
+snake_today_yday_fixed(pivot_sora,   "SORA Daily Change (bp): Today vs Yesterday — Fixed Axis",   "snake_sora_FIXED.html")
+snake_today_yday_fixed(pivot_sorafx, "SORA_FX Daily Change (bp): Today vs Yesterday — Fixed Axis","snake_sorafx_FIXED.html")
+snake_today_yday_fixed(pivot_basis,  "Basis Daily Change (bp): Today vs Yesterday — Fixed Axis",  "snake_basis_FIXED.html")
 
-fig2 = px.line(df_long, x="TenorY", y="Rate", color="Curve",
-               animation_frame="DateStr", facet_col="Curve",
-               title="Curve Animation: SORA vs SORA_FX (≤2Y)")
-fig2.show()
+# ---------- PCA (daily changes) with robust NaN handling ----------
+def pca_level_slope_fixed(pivot, label, out_prefix):
+    X = pivot.diff().dropna(how="all") / 100.0  # convert to % units
+    # drop tenor columns that are all NaN (e.g., missing T/N entirely)
+    X = X.dropna(axis=1, how="all")
+    # then drop rows with any NaN (strict PCA input)
+    X = X.dropna(axis=0, how="any")
+    if X.shape[0] < 10 or X.shape[1] < 3:
+        return
+    pca = PCA(n_components=2)
+    scores = pca.fit_transform(X.values)
+    loadings = pca.components_
+    comp_names = ["Level","Slope"]
+
+    # Loadings
+    load_df = pd.DataFrame(loadings, columns=X.columns, index=comp_names).T.reset_index()
+    load_df = load_df.rename(columns={"index":"TenorY"})
+    load_melt = load_df.melt(id_vars="TenorY", var_name="Component", value_name="Loading")
+    figL = px.line(load_melt, x="TenorY", y="Loading", color="Component",
+                   title=f"{label} PCA Loadings (Level & Slope) — Fixed Axis")
+    figL.update_xaxes(tickmode="array", tickvals=CANON_TENORS)
+    figL.write_html(str(Path(export_html_dir)/f"{out_prefix}_pca_loadings_FIXED.html"), include_plotlyjs="cdn")
+
+    # Scores
+    score_df = pd.DataFrame(scores, index=X.index, columns=comp_names).reset_index(names="Date")
+    figS1 = px.line(score_df, x="Date", y="Level", title=f"{label} PCA Score: Level")
+    figS2 = px.line(score_df, x="Date", y="Slope", title=f"{label} PCA Score: Slope")
+    figS1.write_html(str(Path(export_html_dir)/f"{out_prefix}_pca_scores_level_FIXED.html"), include_plotlyjs="cdn")
+    figS2.write_html(str(Path(export_html_dir)/f"{out_prefix}_pca_scores_slope_FIXED.html"), include_plotlyjs="cdn")
+
+pca_level_slope_fixed(pivot_sora,   "SORA",    "sora")
+pca_level_slope_fixed(pivot_sorafx, "SORA_FX", "sorafx")
+pca_level_slope_fixed(pivot_basis,  "BASIS",   "basis")
+
+print("✅ Saved fixed-axis HTMLs to:", Path(export_html_dir).resolve())
