@@ -1,0 +1,214 @@
+# stirt_curve_trader_pack.py
+# --------------------------------------------------------------
+# STIRT (≤ 2Y) yield curve visualization pack
+# Inputs: tidy Excel/CSV with columns EXACTLY:
+#   - Date (e.g., 18/08/2025; day-first ok)
+#   - Tenor (numeric years or labels like 'O/N','1W','6M','1Y','2Y')
+#   - Swap_Implied (yield level in PERCENT, e.g., 3.12)
+#
+# Outputs (HTML, interactive):
+# 1) stirt_today_vs_yday.html
+# 2) stirt_animation.html
+# 3) stirt_changes_heatmap.html
+# 4) stirt_pca_loadings.html (Level & Slope)
+# 5) stirt_pca_scores.html   (Level & Slope time series)
+#
+# Usage:
+#   pip install pandas numpy plotly scikit-learn openpyxl
+#   python stirt_curve_trader_pack.py --input curves.xlsx --sheet Sheet1 --outdir outputs
+# --------------------------------------------------------------
+
+import argparse
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.decomposition import PCA
+
+TENOR_MAP = {
+    "O/N": 1/365, "ON": 1/365, "1D": 1/365,
+    "1W": 7/365, "2W": 14/365, "3W": 21/365,
+    "1M": 1/12, "2M": 2/12, "3M": 3/12,
+    "4M": 4/12, "5M": 5/12, "6M": 6/12, "9M": 9/12,
+    "12M": 1.0, "1Y": 1.0,
+    "15M": 15/12, "18M": 18/12,
+    "2Y": 2.0
+}
+
+def coerce_tenor_years(s):
+    def _one(x):
+        if pd.isna(x): return np.nan
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            return float(x)
+        xs = str(x).strip().upper()
+        if xs in TENOR_MAP:
+            return float(TENOR_MAP[xs])
+        # numeric string?
+        try:
+            return float(xs)
+        except:
+            pass
+        # patterns '6M', '2Y'
+        if xs.endswith("M"):
+            try: return float(xs[:-1]) / 12.0
+            except: return np.nan
+        if xs.endswith("Y"):
+            try: return float(xs[:-1])
+            except: return np.nan
+        return np.nan
+    return s.apply(_one)
+
+def interp_within_day(g):
+    g = g.sort_values("TenorY").copy()
+    g["Swap_Implied"] = pd.to_numeric(g["Swap_Implied"], errors="coerce")
+    g["Swap_Implied"] = g["Swap_Implied"].interpolate(method="values", limit_direction="both")
+    return g
+
+def load_data(path: Path, sheet: str | None):
+    # Strictly expect Date, Tenor, Swap_Implied
+    if path.suffix.lower() in [".xlsx", ".xls"]:
+        df = pd.read_excel(path, sheet_name=sheet, dtype={"Tenor": object})
+    elif path.suffix.lower() in [".csv", ".txt"]:
+        df = pd.read_csv(path, dtype={"Tenor": object})
+    else:
+        raise ValueError("Use .xlsx/.xls/.csv/.txt")
+
+    missing = [c for c in ["Date","Tenor","Swap_Implied"] if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}. Found: {list(df.columns)}")
+
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    df["TenorY"] = coerce_tenor_years(df["Tenor"])
+    df = df.dropna(subset=["Date","TenorY","Swap_Implied"]).copy()
+
+    # Hard cap to STIRT domain (≤ 2Y)
+    df = df[df["TenorY"] <= 2.0]
+
+    # Sort & per-day tenor interpolation
+    df = df.sort_values(["Date","TenorY"]).reset_index(drop=True)
+    df = df.groupby("Date", group_keys=False).apply(interp_within_day)
+
+    # Keep unique points
+    df = df.drop_duplicates(subset=["Date","TenorY"])
+
+    return df
+
+def last_two_dates(idx):
+    if len(idx) < 2: return None, None
+    return idx[-2], idx[-1]
+
+def fig_today_vs_yday(df: pd.DataFrame):
+    dates = pd.Index(sorted(df["Date"].unique()))
+    d0, d1 = last_two_dates(dates)
+    if d0 is None: return None
+    g0 = df[df["Date"] == d0]
+    g1 = df[df["Date"] == d1]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=g0["TenorY"], y=g0["Swap_Implied"],
+                             mode="lines+markers", name=str(d0.date())))
+    fig.add_trace(go.Scatter(x=g1["TenorY"], y=g1["Swap_Implied"],
+                             mode="lines+markers", name=str(d1.date())))
+    fig.update_layout(
+        title=f"STIRT Yield Curve: {d1.date()} vs {d0.date()}",
+        xaxis_title="Tenor (Years)",
+        yaxis_title="Swap Implied (%)",
+        legend_title="Date",
+        hovermode="x unified"
+    )
+    return fig
+
+def fig_animation(df: pd.DataFrame):
+    dfa = df.copy()
+    dfa["DateStr"] = dfa["Date"].dt.strftime("%Y-%m-%d")
+    fig = px.line(dfa, x="TenorY", y="Swap_Implied", color="DateStr",
+                  animation_frame="DateStr",
+                  labels={"TenorY":"Tenor (Years)", "Swap_Implied":"Yield (%)"})
+    fig.update_layout(title="STIRT Yield Curve Animation (≤ 2Y)", showlegend=False)
+    return fig
+
+def fig_heatmap_changes(df: pd.DataFrame):
+    pivot = df.pivot_table(index="Date", columns="TenorY", values="Swap_Implied")
+    chg_bp = pivot.diff().mul(100)  # bp
+    fig = px.imshow(
+        chg_bp,
+        origin="lower", aspect="auto",
+        color_continuous_scale="RdBu_r",
+        labels=dict(x="Tenor (Years)", y="Date", color="Δ bp")
+    )
+    fig.update_layout(title="STIRT Daily Curve Changes (bp)")
+    return fig
+
+def fig_pca(df: pd.DataFrame):
+    pivot = df.pivot_table(index="Date", columns="TenorY", values="Swap_Implied")
+    X = pivot.diff().dropna() / 100.0  # convert bp->% units
+
+    # Need enough data
+    if X.shape[0] < 10 or X.shape[1] < 3:
+        return None, None
+
+    max_tenor = float(X.columns.max())
+    n_components = 2 if max_tenor <= 2.0 else min(3, X.shape[1])
+
+    pca = PCA(n_components=n_components)
+    scores = pca.fit_transform(X.values)
+    loadings = pca.components_
+    comp_names = ["Level","Slope","Curvature"][:n_components]
+
+    # Loadings
+    load_df = pd.DataFrame(loadings, columns=X.columns, index=comp_names).T.reset_index()
+    load_df = load_df.rename(columns={"index":"TenorY"})
+    load_melt = load_df.melt(id_vars="TenorY", var_name="Component", value_name="Loading")
+
+    fig_load = px.line(load_melt, x="TenorY", y="Loading", color="Component",
+                       title="PCA Loadings (STIRT: Level & Slope)",
+                       labels={"TenorY":"Tenor (Years)"})
+
+    # Scores
+    score_df = pd.DataFrame(scores, index=X.index, columns=comp_names).reset_index(names="Date")
+    score_melt = score_df.melt(id_vars="Date", var_name="Component", value_name="Score")
+    fig_score = px.line(score_melt, x="Date", y="Score", color="Component",
+                        title="PCA Scores (Daily Factor Moves)")
+
+    return fig_load, fig_score
+
+def main():
+    parser = argparse.ArgumentParser(description="STIRT (≤ 2Y) yield curve visualization pack")
+    parser.add_argument("--input", required=True, help="Path to .xlsx/.csv with Date, Tenor, Swap_Implied")
+    parser.add_argument("--sheet", default=None, help="Excel sheet name (if .xlsx)")
+    parser.add_argument("--outdir", default=".", help="Output directory")
+    args = parser.parse_args()
+
+    inp = Path(args.input); out = Path(args.outdir); out.mkdir(parents=True, exist_ok=True)
+    df = load_data(inp, args.sheet)
+
+    # 1) Today vs Yesterday
+    fig1 = fig_today_vs_yday(df)
+    if fig1 is not None:
+        fig1.write_html(str(out / "stirt_today_vs_yday.html"), include_plotlyjs="cdn")
+
+    # 2) Animation
+    fig2 = fig_animation(df)
+    fig2.write_html(str(out / "stirt_animation.html"), include_plotlyjs="cdn")
+
+    # 3) Heatmap of daily bp changes
+    fig3 = fig_heatmap_changes(df)
+    fig3.write_html(str(out / "stirt_changes_heatmap.html"), include_plotlyjs="cdn")
+
+    # 4) PCA (Level & Slope if ≤ 2Y)
+    fig4, fig5 = fig_pca(df)
+    if fig4 is not None:
+        fig4.write_html(str(out / "stirt_pca_loadings.html"), include_plotlyjs="cdn")
+    if fig5 is not None:
+        fig5.write_html(str(out / "stirt_pca_scores.html"), include_plotlyjs="cdn")
+
+    print("✅ Done. Saved to:", out.resolve())
+    print(" - stirt_today_vs_yday.html")
+    print(" - stirt_animation.html")
+    print(" - stirt_changes_heatmap.html")
+    if fig4 is not None: print(" - stirt_pca_loadings.html")
+    if fig5 is not None: print(" - stirt_pca_scores.html")
+
+if __name__ == "__main__":
+    main()
